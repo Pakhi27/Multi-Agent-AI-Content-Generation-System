@@ -41,7 +41,7 @@ class Task(BaseModel):
         max_length=4,
         description="3–4 concrete, non-overlapping subpoints to cover in this section.",
     )
-    target_words: int = Field(..., description="Target word count for this section (150–350).")
+    target_words: int = Field(..., description="Target word count for this section (350–600).")
     tags: List[str] = Field(default_factory=list)
     requires_research: bool = False
     requires_citations: bool = False
@@ -54,7 +54,7 @@ class Plan(BaseModel):
     tone: str
     blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
     constraints: List[str] = Field(default_factory=list)
-    tasks: List[Task] = Field(..., min_length=4, max_length=6)
+    tasks: List[Task] = Field(..., min_length=6, max_length=6)
 
 
 class EvidenceItem(BaseModel):
@@ -328,14 +328,14 @@ def research_node(state: State) -> dict:
 
 # -----------------------------
 # 5) Orchestrator
-# FIX: Explicit JSON schema in prompt + safe fallback parser
+# FIX: Force 6 sections + higher word counts
 # -----------------------------
-ORCH_SYSTEM = """You are a technical blog planner. Produce a concise outline.
+ORCH_SYSTEM = """You are a technical blog planner. Produce a detailed, comprehensive outline.
 
 Rules:
-- Create EXACTLY 4–6 sections (no more than 6).
-- Each section: goal (1 sentence), 3–4 bullets, target_words 150–350.
-- Include at least 1 section with requires_code=true.
+- Create EXACTLY 6 sections — no fewer, no more.
+- Each section: goal (1 sentence), 3–4 bullets, target_words 350–600.
+- Include at least 2 sections with requires_code=true for richer technical depth.
 - closed_book: evergreen content only.
 - hybrid: use evidence for examples; set requires_citations=true on those sections.
 - open_book: blog_kind="news_roundup", summarize events with evidence URLs.
@@ -354,7 +354,7 @@ You MUST respond with a JSON object that EXACTLY matches this structure — no e
       "title": "Section Title Here",
       "goal": "One sentence describing what the reader learns.",
       "bullets": ["point 1", "point 2", "point 3"],
-      "target_words": 200,
+      "target_words": 400,
       "tags": [],
       "requires_research": false,
       "requires_citations": false,
@@ -368,6 +368,7 @@ CRITICAL RULES:
 - Every task MUST include all fields: id, title, goal, bullets, target_words, tags, requires_research, requires_citations, requires_code.
 - blog_title, audience, and tone are REQUIRED at the top level — never omit them.
 - blog_kind must be one of: explainer, tutorial, news_roundup, comparison, system_design.
+- target_words for each section MUST be between 350 and 600.
 - Do NOT add any extra fields beyond what is shown above.
 - Respond in JSON format only.
 """
@@ -387,6 +388,12 @@ def _fix_plan_dict(data: dict) -> dict:
     data.setdefault("blog_kind", "explainer")
     data.setdefault("constraints", [])
 
+    # Fix: ensure exactly 6 tasks by duplicating/trimming if needed
+    tasks = data.get("tasks", [])
+    # Trim to 6 if over
+    if len(tasks) > 6:
+        data["tasks"] = tasks[:6]
+
     # Fix: task-level missing/extra fields
     allowed_task_keys = {
         "id", "title", "goal", "bullets", "target_words",
@@ -399,6 +406,10 @@ def _fix_plan_dict(data: dict) -> dict:
         task.setdefault("requires_research", False)
         task.setdefault("requires_citations", False)
         task.setdefault("requires_code", False)
+
+        # Enforce minimum target_words of 350
+        if task.get("target_words", 0) < 350:
+            task["target_words"] = 400
 
         # Remove unknown fields like "blog_kind" that sometimes sneak into tasks
         for key in list(task.keys()):
@@ -466,7 +477,9 @@ Write ONE section of a technical blog post in Markdown.
 
 Hard constraints:
 - Follow the provided Goal and cover ALL Bullets in order (do not skip or merge bullets).
-- Stay close to Target words (±15%).
+- You MUST write AT LEAST the Target words count. Do not stop early.
+  Expand each bullet into 2–3 full paragraphs with concrete detail, examples, and explanations.
+  Going 10–20% over target is acceptable and encouraged; going under is NOT acceptable.
 - Output ONLY the section content in Markdown (no blog title H1, no extra commentary).
 - Start with a '## <Section Title>' heading.
 
@@ -485,18 +498,20 @@ Grounding policy:
 
 Code:
 - If requires_code == true, include at least one minimal, correct code snippet relevant to the bullets.
+  Add a second code snippet if it meaningfully illustrates a different sub-concept.
 
-Style:
-- Short paragraphs, bullets where helpful, code fences for code.
-- Avoid fluff/marketing. Be precise and implementation-oriented.
-- Every paragraph must add a new technical idea.
+Depth guidelines:
+- Write short, dense paragraphs (3–5 sentences each).
+- Use bullet lists sparingly — prefer prose that flows logically.
+- Every paragraph must introduce a new technical idea or deepen the previous one.
 - Avoid repeating definitions already covered in earlier sections.
-- Prefer concrete examples over abstract wording.
+- Prefer concrete examples, worked scenarios, and edge cases over abstract wording.
 - Use short code comments only when they improve understanding.
 - Do not write generic transition sentences like "In today's world" or "This is very important."
-- Write as if explaining to a developer who may implement this after reading.
-- When introducing a formula, explain what it means operationally.
+- Write as if explaining to a developer who will implement this after reading.
+- When introducing a formula, explain what it means operationally and give a numeric example.
 - When describing a failure mode, mention how to detect or debug it.
+- When discussing a concept, compare it to an alternative to build intuition.
 """
 
 
@@ -530,7 +545,8 @@ def worker_node(state: WorkerState) -> dict:
                     f"Mode: {mode}\n\n"
                     f"Section title: {task.title}\n"
                     f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words}\n"
+                    f"Target words: {task.target_words} (MINIMUM — do not write less than this. "
+                    f"Expand each bullet into multiple detailed paragraphs to reach this count.)\n"
                     f"Tags: {task.tags}\n"
                     f"requires_research: {task.requires_research}\n"
                     f"requires_citations: {task.requires_citations}\n"
