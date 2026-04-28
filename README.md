@@ -4,7 +4,7 @@
 
 ---
 
-## 📸 Overview
+##  Overview
 
 BlogForge AI takes a single topic as input and produces a fully-formatted, research-backed Markdown blog post — complete with AI-generated cover images — in 1–2 minutes.
 
@@ -12,30 +12,61 @@ The system is built on a **multi-agent LangGraph pipeline** where specialised ag
 
 ---
 
-## 🏗️ Architecture
+##  Architecture
 
-```
-topic
-  │
-  ▼
-┌─────────┐     needs_research=false     ┌──────────────┐
-│  Router │ ────────────────────────────▶│ Orchestrator │
-│  Agent  │                              │  (Planner)   │
-└─────────┘                              └──────┬───────┘
-  │ needs_research=true                         │ Plan (4–6 tasks)
-  ▼                                             │ fan-out via Send()
-┌──────────┐                                    ▼
-│ Research │                        ┌──────────────────────┐
-│  Agent   │──────────────────────▶ │  Worker Agents (×N)  │
-│ (Tavily) │   evidence pack        │  (parallel sections) │
-└──────────┘                        └──────────┬───────────┘
-                                               │ sections[]
-                                               ▼
-                                    ┌─────────────────────┐
-                                    │   Reducer Subgraph  │
-                                    │  merge → images →   │
-                                    │  place → final .md  │
-                                    └─────────────────────┘
+```mermaid
+flowchart TD
+    A([🗂️ Topic Input]) --> B
+
+    subgraph MAIN["🔁 LangGraph Main Graph"]
+        B["🔀 Router Agent\nDecides research mode\nclosed_book / hybrid / open_book"]
+
+        B -->|needs_research = false| D
+        B -->|needs_research = true| C
+
+        subgraph RESEARCH["🌐 Research Phase"]
+            C["🔎 Research Agent\nTavily web search\nLLM deduplication & validation"]
+        end
+
+        C -->|EvidencePack| D
+
+        D["🧠 Orchestrator Agent\nGenerates structured Plan\n4–6 sections with goals,\nbullets & word targets"]
+
+        D -->|"Send() fan-out"| E
+
+        subgraph WORKERS["⚡ Parallel Workers  — LangGraph Send()"]
+            E1["✍️ Worker 1\nSection"]
+            E2["✍️ Worker 2\nSection"]
+            E3["✍️ Worker N\nSection"]
+        end
+
+        E --> E1 & E2 & E3
+
+        E1 & E2 & E3 -->|sections accumulate| F
+
+        subgraph REDUCER["📦 Reducer Subgraph"]
+            F["🔗 Merge Content\nOrdered assembly of sections"]
+            F --> G["🖼️ Decide Images\nLLM picks ≤2 image placements"]
+            G --> H["🎨 Generate & Place Images\nFlux via Pollinations API\nPillow text overlay\nEmbed into Markdown"]
+        end
+    end
+
+    H --> I([📄 Final Markdown\n+ images/ folder])
+    I --> J["🖥️ Streamlit UI\nBlogForge AI"]
+
+    subgraph UI["🖥️ Streamlit Tabs"]
+        J --> T1["📖 Preview"]
+        J --> T2["🧩 Plan"]
+        J --> T3["🔎 Research"]
+        J --> T4["🖼️ Images"]
+        J --> T5["🪲 Debug Logs"]
+    end
+
+    style MAIN fill:#1a1e25,stroke:#2e3440,color:#e8eaf0
+    style RESEARCH fill:#13161b,stroke:#7a9ee8,color:#e8eaf0
+    style WORKERS fill:#13161b,stroke:#5cb88a,color:#e8eaf0
+    style REDUCER fill:#13161b,stroke:#e8c97a,color:#e8eaf0
+    style UI fill:#13161b,stroke:#2e3440,color:#e8eaf0
 ```
 
 ### Agent Roles
@@ -50,7 +81,7 @@ topic
 
 ---
 
-## ✨ Features
+##  Features
 
 - **Intelligent routing** — automatically selects `closed_book`, `hybrid`, or `open_book` mode based on topic volatility
 - **Web research** — Tavily-powered search with LLM-driven deduplication and source quality filtering
@@ -63,7 +94,7 @@ topic
 
 ---
 
-## 🖥️ UI Tabs
+##  UI Tabs
 
 | Tab | Contents |
 |---|---|
@@ -104,7 +135,7 @@ blogforge-ai/
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### 1. Clone the repository
 
@@ -149,7 +180,7 @@ This will generate a blog on `"Self Attention in Transformer Architecture"` by d
 
 ---
 
-## ⚙️ How It Works — Step by Step
+##  How It Works — Step by Step
 
 1. **Router** receives the topic and determines research mode + generates search queries if needed.
 2. **Research Agent** (optional) queries Tavily, cleans results, and builds a deduplicated `EvidencePack`.
@@ -161,7 +192,7 @@ This will generate a blog on `"Self Attention in Transformer Architecture"` by d
 
 ---
 
-## 📦 Requirements
+##  Requirements
 
 ```
 langgraph
@@ -206,7 +237,7 @@ url = f"...?width=1280&height=720&model=flux..."
 
 ---
 
-## ⚠️ Known Limitations
+##  Known Limitations
 
 - Image generation depends on the free Pollinations API — availability and quality may vary
 - LLaMA 3.3 on Groq has rate limits; large plans with many parallel workers may occasionally hit them (retries are configured)
@@ -215,13 +246,13 @@ url = f"...?width=1280&height=720&model=flux..."
 
 ---
 
-## 📄 License
+##  License
 
 MIT License — feel free to use, modify, and distribute.
 
 ---
 
-## 🙏 Acknowledgements
+##  Acknowledgements
 
 - [LangChain / LangGraph](https://github.com/langchain-ai/langgraph) for the agent orchestration framework
 - [Groq](https://groq.com/) for fast LLaMA inference
