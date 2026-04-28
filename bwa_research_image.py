@@ -227,15 +227,58 @@ Rules:
 - Avoid low-authority recap sites unless nothing better exists.
 - If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
   If missing or unclear, set published_at=null. Do NOT guess.
-- Keep snippets short.
+- Keep snippets short (under 200 characters). Do NOT include code snippets or escape characters in snippets.
 - Deduplicate by URL.
 
-Respond in JSON format.
+You MUST respond with a JSON object that EXACTLY matches this structure — no extra keys, no missing keys:
+
+{
+  "evidence": [
+    {
+      "title": "Page or article title",
+      "url": "https://example.com/page",
+      "published_at": null,
+      "snippet": "Short plain-text summary under 200 chars.",
+      "source": "example.com"
+    }
+  ]
+}
+
+CRITICAL:
+- The list MUST be called "evidence" — NOT "evidence_items", "items", "results", or any other name.
+- Every item MUST have: title, url, published_at, snippet, source.
+- Snippets must be plain text only — no code, no escape sequences, no markdown.
+- Respond in JSON format only. No markdown, no preamble.
 """
 
 
+def _fix_evidence_dict(data: dict) -> dict:
+    """Auto-correct common LLM schema mistakes in EvidencePack output."""
+    # Fix: LLM used wrong key name for the list
+    for wrong_key in ("evidence_items", "items", "results", "sources", "documents"):
+        if wrong_key in data and "evidence" not in data:
+            data["evidence"] = data.pop(wrong_key)
+            break
+
+    # Fix: missing fields on individual evidence items
+    for item in data.get("evidence", []):
+        item.setdefault("title", "")
+        item.setdefault("published_at", None)
+        item.setdefault("snippet", None)
+        item.setdefault("source", None)
+
+        # Fix: strip code/escape sequences from snippets (root cause of malformed JSON)
+        if item.get("snippet"):
+            snippet = item["snippet"]
+            snippet = re.sub(r"\\[ntr\\\"']", " ", snippet)   # unescape sequences
+            snippet = re.sub(r"\s+", " ", snippet).strip()
+            item["snippet"] = snippet[:200]
+
+    return data
+
+
 def research_node(state: State) -> dict:
-    queries = (state.get("queries") or [])[:3]   # max 3 queries
+    queries = (state.get("queries") or [])[:3]
     raw_results: List[dict] = []
     for q in queries:
         raw_results.extend(_tavily_search(q, max_results=3))
@@ -243,20 +286,37 @@ def research_node(state: State) -> dict:
     if not raw_results:
         return {"evidence": []}
 
-    # Hard cap at 10 results total before sending to LLM
     raw_results = raw_results[:10]
 
-    formatted_results = "\n\n".join(
-        [
-            f"Title: {r['title']}\nURL: {r['url']}\nPublished: {r.get('published_at')}\nSnippet: {r.get('snippet')}"
-            for r in raw_results
-        ]
-    )
-    extractor = llm_fast.with_structured_output(EvidencePack, method="json_mode")
-    pack = extractor.invoke([
-        SystemMessage(content=RESEARCH_SYSTEM),
-        HumanMessage(content=f"Raw search results:\n\n{formatted_results}"),
+    formatted_results = "\n\n".join([
+        f"Title: {r['title']}\nURL: {r['url']}\nPublished: {r.get('published_at')}\nSnippet: {r.get('snippet')}"
+        for r in raw_results
     ])
+
+    # Use raw json_mode + manual fix instead of with_structured_output
+    raw_llm = llm_fast.bind(response_format={"type": "json_object"})
+
+    try:
+        response = raw_llm.invoke([
+            SystemMessage(content=RESEARCH_SYSTEM),
+            HumanMessage(content=f"Raw search results:\n\n{formatted_results}"),
+        ])
+        raw = json.loads(response.content)
+        fixed = _fix_evidence_dict(raw)
+        pack = EvidencePack.model_validate(fixed)
+    except Exception as e:
+        print(f"✕ Research node parse error: {e} — falling back to direct extraction")
+        # Fallback: build EvidencePack directly from raw Tavily results, skip LLM
+        pack = EvidencePack(evidence=[
+            EvidenceItem(
+                title=r.get("title") or "",
+                url=r["url"],
+                published_at=r.get("published_at"),
+                snippet=(r.get("snippet") or "")[:200],
+                source=r.get("source"),
+            )
+            for r in raw_results if r.get("url")
+        ])
 
     dedup = {}
     for e in pack.evidence:
