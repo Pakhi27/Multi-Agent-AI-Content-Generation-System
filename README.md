@@ -212,7 +212,7 @@ python-dotenv
 
 ---
 
-## 🔧 Configuration & Customisation
+##  Configuration & Customisation
 
 **Change the default topic** in `bwa_research_image.py`:
 ```python
