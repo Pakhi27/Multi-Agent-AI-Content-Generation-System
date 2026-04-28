@@ -1,423 +1,686 @@
-# ============================================================
-# 🧠 BWA RESEARCH + IMAGE AGENT  (LangGraph)
-# Improvements:
-#   - Upgraded to claude-sonnet-4-20250514
-#   - Fixed image injection into final markdown
-#   - Added retry logic and better error handling
-#   - Structured outputs via Pydantic for all nodes
-#   - Images saved to a stable absolute path
-#   - Sections merged with continuity prompt for complete blogs
-# ============================================================
-
 from __future__ import annotations
 
-import base64
-import json
-import os
-import re
-import textwrap
-import time
+import operator
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import TypedDict, List, Optional, Literal, Annotated
+from unittest import result
 
-import anthropic
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field,field_validator
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.tools.tavily_search import TavilySearchResults
+import os
+import urllib.parse
 import requests
-from langgraph.graph import END, StateGraph
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
-# ── Constants ────────────────────────────────────────────────────────────────
+load_dotenv()  # Load environment variables from .env file
 
-MODEL = "claude-sonnet-4-20250514"          # latest Sonnet 4
-FAST_MODEL = "claude-haiku-4-5-20251001"    # fast model for cheap tasks
-IMAGES_DIR = Path(__file__).parent / "images"
-IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+# -----------------------------
+# 1) Schemas
+# -----------------------------
+class Task(BaseModel):
+    id: int
+    title: str
+    goal: str = Field(
+        ...,
+        description="One sentence describing what the reader should be able to do/understand after this section.",
+    )
+    bullets: List[str] = Field(
+        ...,
+        min_length=3,
+        max_length=4,
+        description="3–4 concrete, non-overlapping subpoints to cover in this section.",
+    )
+    target_words: int = Field(..., description="Target word count for this section (150–350).")
+    tags: List[str] = Field(default_factory=list)
+    requires_research: bool = False
+    requires_citations: bool = False
+    requires_code: bool = False
 
-client = anthropic.Anthropic()              # reads ANTHROPIC_API_KEY from env
 
-
-# ── Pydantic Schemas ──────────────────────────────────────────────────────────
-
-class SectionTask(BaseModel):
-    section_id: str
-    heading: str
-    goal: str
-    word_count: int = 300
-
-
-class BlogPlan(BaseModel):
+class Plan(BaseModel):
     blog_title: str
     audience: str
     tone: str
-    tasks: List[SectionTask]
+    blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
+    constraints: List[str] = Field(default_factory=list)
+    tasks: List[Task] = Field(..., min_length=4, max_length=6)
 
 
-class Evidence(BaseModel):
+class EvidenceItem(BaseModel):
     title: str
-    source: str
     url: str
-    snippet: str
+    published_at: Optional[str] = None
+    snippet: Optional[str] = Field(default=None, max_length=200)
+    source: Optional[str] = None
 
 
-class ImageSpec(BaseModel):
-    section_id: str
-    filename: str
-    alt_text: str
-    prompt: str          # used for image generation / search query
+class RouterDecision(BaseModel):
+    needs_research: bool
+    mode: Literal["closed_book", "hybrid", "open_book"] = "closed_book"
+    queries: List[str] = Field(default_factory=list)
+
+    @field_validator("needs_research", mode="before")
+    @classmethod
+    def coerce_bool(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower() not in ("false", "0", "no", "")
+        return v
 
 
-# ── Graph State ───────────────────────────────────────────────────────────────
+class EvidencePack(BaseModel):
+    evidence: List[EvidenceItem] = Field(default_factory=list)
 
-class BlogState(TypedDict):
+
+# -----------------------------
+# 2) State
+# -----------------------------
+class State(TypedDict):
     topic: str
-    mode: str                        # "research" | "fast"
+
+    # routing / research
+    mode: str
     needs_research: bool
     queries: List[str]
-    evidence: List[Evidence]
-    plan: Optional[BlogPlan]
-    sections: List[Dict[str, str]]   # [{"section_id": ..., "content": ...}]
+    evidence: List[EvidenceItem]
+    plan: Optional[Plan]
+
+    # workers
+    sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
+
+    # reducer/image
     merged_md: str
     md_with_placeholders: str
-    image_specs: List[ImageSpec]
+    image_specs: List[dict]
+
     final: str
-    errors: List[str]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _claude(
-    system: str,
-    user: str,
-    model: str = MODEL,
-    max_tokens: int = 4096,
-    retries: int = 3,
-) -> str:
-    """Call Claude with retry logic."""
-    for attempt in range(retries):
-        try:
-            resp = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-            return resp.content[0].text
-        except anthropic.RateLimitError:
-            wait = 2 ** attempt
-            time.sleep(wait)
-        except Exception as e:
-            if attempt == retries - 1:
-                raise
-            time.sleep(1)
-    return ""
+# -----------------------------
+# 2b) Worker subgraph state
+# Note: Send() passes a dict that becomes the node's state.
+# We define a separate typed dict for the worker payload.
+# -----------------------------
+class WorkerState(TypedDict):
+    task: dict
+    topic: str
+    mode: str
+    plan: dict
+    evidence: List[dict]
 
 
-def _parse_json(text: str) -> Any:
-    """Strip markdown fences and parse JSON safely."""
-    text = re.sub(r"```(?:json)?", "", text).replace("```", "").strip()
-    return json.loads(text)
+load_dotenv()
+
+llm_strong = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0.2,
+    max_retries=5
+)
+
+llm_fast = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0.0,
+    max_retries=5
+)
+
+llm_worker = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0.3,
+    max_retries=5
+)
+
+# -----------------------------
+# 3) Router
+# -----------------------------
+ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
+
+Decide whether web research is needed BEFORE planning.
+
+Modes:
+- closed_book (needs_research=false):
+  Evergreen topics where correctness does not depend on recent facts (concepts, fundamentals).
+- hybrid (needs_research=true):
+  Mostly evergreen but needs up-to-date examples/tools/models to be useful.
+- open_book (needs_research=true):
+  Mostly volatile: weekly roundups, "this week", "latest", rankings, pricing, policy/regulation.
+
+If needs_research=true, include 3-5 specific search queries.
+
+You MUST always respond with a JSON object containing ALL THREE of these keys:
+{
+  "needs_research": true or false,
+  "mode": "closed_book" or "hybrid" or "open_book",
+  "queries": []
+}
+Never omit any key. Use JSON true/false (not strings).
+"""
 
 
-def _search_web(query: str, num_results: int = 5) -> List[Dict]:
-    """
-    Web search via Brave Search API (set BRAVE_API_KEY env var).
-    Falls back gracefully if key is missing.
-    """
-    api_key = os.getenv("BRAVE_API_KEY")
-    if not api_key:
-        return []
-    try:
-        resp = requests.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-            params={"q": query, "count": num_results},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("web", {}).get("results", [])
-        return [
-            {
-                "title": r.get("title", ""),
-                "url": r.get("url", ""),
-                "snippet": r.get("description", ""),
-            }
-            for r in results
+def router_node(state: State) -> dict:
+    topic = state["topic"]
+    decider = llm_strong.with_structured_output(RouterDecision, method="json_mode")
+    decision = decider.invoke(
+        [
+            SystemMessage(content=ROUTER_SYSTEM),
+            HumanMessage(content=f"Topic: {topic}"),
         ]
-    except Exception:
-        return []
+    )
+    return {
+        "needs_research": decision.needs_research,
+        "mode": decision.mode,
+        "queries": decision.queries,
+    }
 
 
-def _generate_image(spec: ImageSpec) -> Optional[Path]:
-    """
-    Generate or fetch an image for a blog section.
-    Uses Claude's vision to generate a simple SVG diagram as a fallback
-    when no image generation API is available.
-    """
-    # Try Unsplash free API first (no key needed for demo sizes)
-    try:
-        url = f"https://source.unsplash.com/800x400/?{requests.utils.quote(spec.prompt)}"
-        resp = requests.get(url, timeout=15, allow_redirects=True)
-        if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-            out_path = IMAGES_DIR / spec.filename
-            out_path.write_bytes(resp.content)
-            return out_path
-    except Exception:
-        pass
+def route_next(state: State) -> str:
+    return "research" if state["needs_research"] else "orchestrator"
 
-    # Fallback: generate a simple SVG diagram via Claude
-    try:
-        svg_text = _claude(
-            system="You are an SVG diagram generator. Output ONLY valid SVG code, no prose, no backticks.",
-            user=(
-                f"Create a clean, informative SVG diagram (800x400 viewBox) illustrating: {spec.prompt}. "
-                "Use a white background, clear labels, and a modern flat style."
+
+# -----------------------------
+# 4) Research
+# -----------------------------
+def _clean_snippet(text: str, max_len: int = 200) -> str:
+    if not text:
+        return ""
+    # Strip markdown headings, links, code fences
+    text = re.sub(r"#{1,6}\s+", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^\)]+\)", r"\1", text)
+    text = re.sub(r"`{1,3}[^`]*`{1,3}", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_len]
+
+def _tavily_search(query: str, max_results: int = 3) -> List[dict]:
+    tool = TavilySearchResults(max_results=max_results)
+    response = tool.invoke({"query": query})
+    results = response if isinstance(response, list) else response.get("results", [])
+
+    normalized: List[dict] = []
+    for r in results or []:
+        if isinstance(r, dict):
+            normalized.append({
+                "title": (r.get("title") or "")[:80],
+                "url": r.get("url") or "",
+                 "snippet": _clean_snippet(r.get("content") or r.get("snippet") or ""),
+                "published_at": r.get("published_date") or r.get("published_at"),
+                "source": r.get("source"),
+            })
+    return normalized
+
+
+RESEARCH_SYSTEM = """You are a research synthesizer for technical writing.
+
+Given raw web search results, produce a deduplicated list of EvidenceItem objects.
+
+Rules:
+- Only include items with a non-empty url.
+- Strongly prefer official documentation, research papers, framework docs, and reputable engineering blogs.
+- Avoid low-authority recap sites unless nothing better exists.
+- If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
+  If missing or unclear, set published_at=null. Do NOT guess.
+- Keep snippets short.
+- Deduplicate by URL.
+
+Respond in JSON format.
+"""
+
+
+def research_node(state: State) -> dict:
+    queries = (state.get("queries") or [])[:3]   # max 3 queries
+    raw_results: List[dict] = []
+    for q in queries:
+        raw_results.extend(_tavily_search(q, max_results=3))
+
+    if not raw_results:
+        return {"evidence": []}
+
+    # Hard cap at 10 results total before sending to LLM
+    raw_results = raw_results[:10]
+    
+    formatted_results = "\n\n".join(
+    [
+        f"Title: {r['title']}\nURL: {r['url']}\nPublished: {r.get('published_at')}\nSnippet: {r.get('snippet')}"
+        for r in raw_results
+    ]
+)
+    extractor = llm_fast.with_structured_output(EvidencePack, method="json_mode")
+    pack = extractor.invoke([
+        SystemMessage(content=RESEARCH_SYSTEM),
+        HumanMessage(content=f"Raw search results:\n\n{formatted_results}"),
+    ])
+
+    dedup = {}
+    for e in pack.evidence:
+        if e.url:
+            dedup[e.url] = e
+
+    return {"evidence": list(dedup.values())}
+
+# -----------------------------
+# 5) Orchestrator
+# -----------------------------
+ORCH_SYSTEM = """You are a technical blog planner. Produce a concise outline.
+
+Rules:
+- Create EXACTLY 4–6 sections (no more than 6).
+- Each section: goal (1 sentence), 3–4 bullets, target_words 150–350.
+- Include at least 1 section with requires_code=True.
+- closed_book: evergreen content only.
+- hybrid: use evidence for examples; set requires_citations=True on those sections.
+- open_book: blog_kind="news_roundup", summarize events with evidence URLs.
+
+Output must strictly match the Plan schema. Respond in JSON format.
+"""
+
+
+def orchestrator_node(state: State) -> dict:
+    planner = llm_strong.with_structured_output(Plan, method="json_mode")
+    evidence = state.get("evidence") or []
+    mode = state.get("mode") or "closed_book"
+
+    plan = planner.invoke(
+        [
+            SystemMessage(content=ORCH_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"Mode: {mode}\n\n"
+                    f"Evidence (ONLY use for fresh claims; may be empty):\n"
+                    f"{[e.model_dump() for e in evidence][:16]}"
+                )
             ),
-            model=FAST_MODEL,
-            max_tokens=2048,
-        )
-        svg_match = re.search(r"<svg[\s\S]*</svg>", svg_text, re.IGNORECASE)
-        if svg_match:
-            out_path = IMAGES_DIR / spec.filename.replace(".png", ".svg")
-            out_path.write_text(svg_match.group(0), encoding="utf-8")
-            return out_path
-    except Exception:
-        pass
-
-    return None
-
-
-# ── Graph Nodes ───────────────────────────────────────────────────────────────
-
-def router_node(state: BlogState) -> BlogState:
-    """Decide whether the topic needs web research."""
-    answer = _claude(
-        system="You are a routing classifier. Reply ONLY with JSON: {\"needs_research\": true/false, \"mode\": \"research\"|\"fast\"}",
-        user=f"Does writing a technical blog about '{state['topic']}' benefit from current web research? "
-             "Answer true if the topic involves recent events, statistics, or rapidly evolving tech.",
-        model=FAST_MODEL,
-        max_tokens=64,
+        ]
     )
-    try:
-        parsed = _parse_json(answer)
-        return {**state, **parsed, "errors": state.get("errors", [])}
-    except Exception:
-        return {**state, "needs_research": True, "mode": "research", "errors": state.get("errors", [])}
+    return {"plan": plan}
 
 
-def research_node(state: BlogState) -> BlogState:
-    """Generate search queries and fetch evidence."""
-    if not state.get("needs_research"):
-        return state
-
-    # Generate queries
-    raw = _claude(
-        system='Reply ONLY with a JSON array of 4 search query strings. Example: ["query1","query2"]',
-        user=f"Generate web search queries to research: {state['topic']}",
-        model=FAST_MODEL,
-        max_tokens=256,
-    )
-    try:
-        queries = _parse_json(raw)
-    except Exception:
-        queries = [state["topic"]]
-
-    evidence: List[Evidence] = []
-    for q in queries[:4]:
-        results = _search_web(q)
-        for r in results:
-            if r.get("snippet"):
-                evidence.append(
-                    Evidence(
-                        title=r["title"],
-                        source=r["url"].split("/")[2] if r.get("url") else "web",
-                        url=r.get("url", ""),
-                        snippet=r["snippet"],
-                    )
-                )
-
-    return {**state, "queries": queries, "evidence": evidence}
-
-
-def orchestrator_node(state: BlogState) -> BlogState:
-    """Create the blog plan with sections."""
-    evidence_ctx = ""
-    if state.get("evidence"):
-        snippets = "\n".join(
-            f"- [{e.title}]({e.url}): {e.snippet}" for e in state["evidence"][:8]
-        )
-        evidence_ctx = f"\n\nAvailable research:\n{snippets}"
-
-    raw = _claude(
-        system=textwrap.dedent("""\
-            You are a technical blog architect.
-            Reply ONLY with valid JSON matching this schema:
+# -----------------------------
+# 6) Fanout
+# -----------------------------
+def fanout(state: State):
+    return [
+        Send(
+            "worker",
             {
-              "blog_title": "string",
-              "audience": "string",
-              "tone": "string",
-              "tasks": [
-                {"section_id": "s1", "heading": "string", "goal": "string", "word_count": 350}
-              ]
-            }
-            Include 5-7 sections. The first should be an Introduction and the last a Conclusion.
-        """),
-        user=f"Plan a comprehensive technical blog about: {state['topic']}{evidence_ctx}",
-        max_tokens=2048,
-    )
-    try:
-        plan = BlogPlan(**_parse_json(raw))
-    except Exception as e:
-        # Fallback plan
-        plan = BlogPlan(
-            blog_title=f"Understanding {state['topic']}",
-            audience="developers and technical practitioners",
-            tone="clear, informative, and engaging",
-            tasks=[
-                SectionTask(section_id="s1", heading="Introduction", goal="Introduce the topic", word_count=200),
-                SectionTask(section_id="s2", heading="Core Concepts", goal="Explain fundamentals", word_count=400),
-                SectionTask(section_id="s3", heading="Deep Dive", goal="Technical details", word_count=500),
-                SectionTask(section_id="s4", heading="Practical Examples", goal="Show real use cases", word_count=400),
-                SectionTask(section_id="s5", heading="Conclusion", goal="Summarize and call to action", word_count=200),
-            ],
+                "task": task.model_dump(),
+                "topic": state["topic"],
+                "mode": state["mode"],
+                "plan": state["plan"].model_dump(),
+                "evidence": [e.model_dump() for e in state.get("evidence") or []],
+            },
         )
+        for task in state["plan"].tasks
+    ]
 
-    return {**state, "plan": plan}
+
+# -----------------------------
+# 7) Worker
+# Use WorkerState signature so keys are accessed correctly.
+# -----------------------------
+WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
+Write ONE section of a technical blog post in Markdown.
+
+Hard constraints:
+- Follow the provided Goal and cover ALL Bullets in order (do not skip or merge bullets).
+- Stay close to Target words (±15%).
+- Output ONLY the section content in Markdown (no blog title H1, no extra commentary).
+- Start with a '## <Section Title>' heading.
+
+Scope guard:
+- If blog_kind == "news_roundup": do NOT turn this into a tutorial/how-to guide.
+  Focus on summarizing events and implications.
+
+Grounding policy:
+- If mode == open_book:
+  - Do NOT introduce any specific event/company/model/funding/policy claim unless it is supported by provided Evidence URLs.
+  - For each event claim, attach a source as a Markdown link using a relevant word or domain name as the text. Do NOT use the word "Source". Example: ([link](URL)) or ([domain.com](URL)).
+  - Only use URLs provided in Evidence. If not supported, write: "Not found in provided sources."
+- If requires_citations == true:
+  - For outside-world claims, cite Evidence URLs the same way.
+- Evergreen reasoning is OK without citations unless requires_citations is true.
+
+Code:
+- If requires_code == true, include at least one minimal, correct code snippet relevant to the bullets.
+
+Style:
+- Short paragraphs, bullets where helpful, code fences for code.
+- Avoid fluff/marketing. Be precise and implementation-oriented.
+- Every paragraph must add a new technical idea.
+- Avoid repeating definitions already covered in earlier sections.
+- Prefer concrete examples over abstract wording.
+- Use short code comments only when they improve understanding.
+- Do not write generic transition sentences like "In today's world" or "This is very important."
+- Write as if explaining to a developer who may implement this after reading.
+- When introducing a formula, explain what it means operationally.
+- When describing a failure mode, mention how to detect or debug it.
+"""
 
 
-def worker_node(state: BlogState) -> BlogState:
-    """Write each section in parallel (sequential here, but structured for easy parallelization)."""
-    plan: BlogPlan = state["plan"]
-    evidence = state.get("evidence", [])
 
-    evidence_ctx = ""
+def worker_node(state: WorkerState) -> dict:
+    task = Task(**state["task"])
+    plan = Plan(**state["plan"])
+    evidence = [EvidenceItem(**e) for e in state.get("evidence") or []]
+    topic = state["topic"]
+    mode = state.get("mode") or "closed_book"
+
+    bullets_text = "\n- " + "\n- ".join(task.bullets)
+
+    evidence_text = ""
     if evidence:
-        evidence_ctx = "\n\nUse these references where relevant:\n" + "\n".join(
-            f"- {e.title} ({e.source}): {e.snippet}" for e in evidence[:10]
+        evidence_text = "\n".join(
+            f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}".strip()
+            for e in evidence[:20]
         )
 
-    sections: List[Dict[str, str]] = []
-    image_specs: List[ImageSpec] = []
-
-    for i, task in enumerate(plan.tasks):
-        system = textwrap.dedent(f"""\
-            You are a technical writer producing a section of a blog post.
-            Blog title: {plan.blog_title}
-            Audience: {plan.audience}
-            Tone: {plan.tone}
-
-            Write ONLY the section content in Markdown (no title at top—the heading will be added).
-            Target ~{task.word_count} words. Be thorough, concrete, and avoid fluff.
-            If relevant, include a code block or formula.
-            At the end, if this section benefits from a diagram or illustration,
-            add exactly ONE line: IMAGE_PLACEHOLDER::<filename.png>::<alt text>::<image description for generation>
-        """)
-
-        content = _claude(
-            system=system,
-            user=f"Write the '{task.heading}' section.\nGoal: {task.goal}{evidence_ctx}",
-            max_tokens=1500,
-        )
-
-        # Extract image placeholder if present
-        img_match = re.search(
-            r"IMAGE_PLACEHOLDER::([^:]+)::([^:]+)::(.+)", content
-        )
-        if img_match:
-            fname, alt, prompt = img_match.group(1), img_match.group(2), img_match.group(3)
-            # Sanitize filename
-            fname = re.sub(r"[^a-z0-9_\-.]", "_", fname.lower())
-            image_specs.append(
-                ImageSpec(
-                    section_id=task.section_id,
-                    filename=fname,
-                    alt_text=alt,
-                    prompt=prompt,
+    section_md = llm_worker.invoke(
+        [
+            SystemMessage(content=WORKER_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Blog title: {plan.blog_title}\n"
+                    f"Audience: {plan.audience}\n"
+                    f"Tone: {plan.tone}\n"
+                    f"Blog kind: {plan.blog_kind}\n"
+                    f"Constraints: {plan.constraints}\n"
+                    f"Topic: {topic}\n"
+                    f"Mode: {mode}\n\n"
+                    f"Section title: {task.title}\n"
+                    f"Goal: {task.goal}\n"
+                    f"Target words: {task.target_words}\n"
+                    f"Tags: {task.tags}\n"
+                    f"requires_research: {task.requires_research}\n"
+                    f"requires_citations: {task.requires_citations}\n"
+                    f"requires_code: {task.requires_code}\n"
+                    f"Bullets:{bullets_text}\n\n"
+                    f"Evidence (ONLY use these URLs when citing):\n{evidence_text}\n"
                 )
-            )
-            # Replace placeholder with markdown image reference
-            content = re.sub(
-                r"IMAGE_PLACEHOLDER::[^\n]+",
-                f"![{alt}](images/{fname})",
-                content,
-            )
+            ),
+        ]
+    ).content.strip()
 
-        sections.append({"section_id": task.section_id, "heading": task.heading, "content": content})
-
-    return {**state, "sections": sections, "image_specs": image_specs}
+    return {"sections": [(task.id, section_md)]}
 
 
-def reducer_node(state: BlogState) -> BlogState:
-    """Merge all sections into a single coherent Markdown document."""
-    plan: BlogPlan = state["plan"]
-    sections = state["sections"]
+# -----------------------------
+# 8) Reducer
+# -----------------------------
+class ImageSpec(BaseModel):
+    filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
+    alt: str
+    caption: str
+    prompt: str = Field(..., description="Prompt to send to the image model.")
+    target_heading: str = Field(..., description="The EXACT heading text (without the ##) under which to place the image.")
+    size: Literal["1024x1024", "1024x1536", "1536x1024"] = "1024x1024"
+    quality: Literal["low", "medium", "high"] = "medium"
 
-    # Build raw merged markdown
-    parts = [f"# {plan.blog_title}\n"]
-    parts.append(f"*Audience: {plan.audience} · Tone: {plan.tone}*\n\n---\n")
 
-    for sec in sections:
-        parts.append(f"\n## {sec['heading']}\n\n{sec['content'].strip()}\n")
+class GlobalImagePlan(BaseModel):
+    images: List[ImageSpec] = Field(default_factory=list)
 
-    merged = "\n".join(parts)
+# ============================================================
+# 8) ReducerWithImages (subgraph)
+#    merge_content -> decide_images -> generate_and_place_images
+# ============================================================
+# ============================================================
+#  FAST ReducerWithImages (SDXL-TURBO OPTIMIZED)
+# ============================================================
 
-    # Polish pass — fix transitions, remove repetition, ensure completeness
-    polished = _claude(
-        system=textwrap.dedent("""\
-            You are a senior technical editor. You receive a draft blog in Markdown.
-            Your job:
-            1. Ensure smooth transitions between sections.
-            2. Remove any repeated sentences or ideas.
-            3. Make sure the Introduction sets context and the Conclusion summarizes properly.
-            4. Fix any broken Markdown (unclosed bold, bad headers, etc.).
-            5. Keep all ## headings, code blocks, and image references (![...](...)) exactly as-is.
-            6. Do NOT add new sections or change the structure.
-            7. Return ONLY the improved Markdown, no commentary.
-        """),
-        user=merged,
-        max_tokens=6000,
+from pathlib import Path
+import os
+
+# -------------------------------
+# 1. Merge Content
+# -------------------------------
+def merge_content(state: State) -> dict:
+    plan = state["plan"]
+
+    ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
+    body = "\n\n".join(ordered_sections).strip()
+    
+    # Strip LLM markdown wrapping if present
+    if body.startswith("```markdown"):
+        body = body[11:]
+    if body.endswith("```"):
+        body = body[:-3]
+        
+    merged_md = f"# {plan.blog_title}\n\n{body}\n"
+
+    return {"merged_md": merged_md}
+
+
+# -------------------------------
+# 2. Decide Images (LIMITED TO 2)
+# -------------------------------
+
+DECIDE_IMAGES_SYSTEM = """You are an expert technical editor and art director.
+
+Rules for Images:
+- Max 2 images only.
+- DO NOT request diagrams with text, arrows, or flowcharts (AI image models fail at generating legible text/diagrams).
+- Instead, request high-quality, abstract, minimalist vector art or conceptual isometric illustrations that visually represent the technical concepts.
+- The prompt MUST be highly descriptive and specify styles like "minimalist, sleek, modern tech, isometric, vector art, vibrant colors".
+
+Return strictly GlobalImagePlan.
+"""
+
+def decide_images(state: State) -> dict:
+    planner = llm_fast.with_structured_output(GlobalImagePlan)
+
+    image_plan = planner.invoke([
+        SystemMessage(content=DECIDE_IMAGES_SYSTEM),
+        HumanMessage(content=state["merged_md"]),
+    ])
+    
+    images = image_plan.images
+
+    # 🔥 force at least 1 image
+    if not images:
+        images = [ImageSpec(
+        filename="diagram.png",
+        alt="diagram",
+        caption="Generated diagram",
+        prompt="simple technical diagram",
+        target_heading="",
+    )]
+
+    return {
+        "md_with_placeholders": state["merged_md"], # Legacy field, kept for state compatibility
+        "image_specs": [img.model_dump() for img in images[:2]],  # force max 2
+    }
+   
+
+
+# -------------------------------
+#  BEST FREE IMAGE PIPELINE (FLUX + PRO TEXT OVERLAY)
+# -------------------------------
+
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
+import textwrap
+
+
+def generate_flux_image(prompt: str):
+    encoded_prompt = urllib.parse.quote(prompt)
+
+    # 🔥 Best free model available right now
+    # Changed to 1280x720 to fix the "image coming very large" issue and provide a better blog banner ratio
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&model=flux&enhance=true&nologo=true"
+    
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    
+    return Image.open(BytesIO(response.content)).convert("RGBA")
+
+
+def add_text_overlay(image: Image.Image, title: str, subtitle: str = ""):
+    image = image.convert("RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    try:
+        font_title = ImageFont.truetype("arial.ttf", 60)
+        font_sub = ImageFont.truetype("arial.ttf", 35)
+    except:
+        font_title = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
+
+    W, H = image.size
+    overlay_height = int(H * 0.35)
+
+    draw.rectangle(
+        [(0, H - overlay_height), (W, H)],
+        fill=(0, 0, 0, 180)
     )
 
-    return {**state, "merged_md": merged, "final": polished or merged}
+    draw.text((50, H - overlay_height + 40), title, font=font_title, fill=(255, 255, 255, 255))
+
+    if subtitle:
+        draw.text((50, H - overlay_height + 120), subtitle, font=font_sub, fill=(220, 220, 220, 255))
+
+    combined = Image.alpha_composite(image, overlay)
+    return combined.convert("RGB")
 
 
-def image_node(state: BlogState) -> BlogState:
-    """Generate/fetch images and update the final markdown with real paths."""
-    image_specs = state.get("image_specs", [])
-    final = state.get("final", "")
+def _sd_generate_image(prompt: str, output_path: Path, title: str = "", subtitle: str = ""):
+    try:
+        img = generate_flux_image(prompt)
+
+        # 🔥 SHORT TITLE for image (important improvement)
+        short_title = " ".join(title.split()[:5])
+
+        img = add_text_overlay(img, short_title, subtitle)
+        img.save(output_path, quality=95)
+
+    except Exception as e:
+        print(f"Image generation failed: {e}")
+
+import re
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[<>:"/\\|?*]', "_", name)
+    name = name.replace("–", "-").replace("—", "-").strip().strip(".")
+    return name or "output"
+    
+# -------------------------------
+# 4. Generate + Place Images
+# -------------------------------
+
+def generate_and_place_images(state: State) -> dict:
+
+    plan = state["plan"]
+
+    md = state.get("md_with_placeholders") or state["merged_md"]
+    image_specs = state.get("image_specs", []) or []
+
+    # Skip images if none
+    if not image_specs:
+        filename = f"{plan.blog_title}.md"
+        Path(filename).write_text(md, encoding="utf-8")
+        return {"final": md}
+
+    images_dir = Path("images")
+    images_dir.mkdir(exist_ok=True)
 
     for spec in image_specs:
-        out_path = _generate_image(spec)
-        if out_path:
-            # Update any remaining placeholder references (both .png and .svg)
-            for ext in [spec.filename, spec.filename.replace(".png", ".svg")]:
-                final = final.replace(f"images/{spec.filename}", f"images/{out_path.name}")
+        filename = spec["filename"]
+        out_path = images_dir / filename
+        heading = spec.get("target_heading", "")
 
-    return {**state, "final": final}
+        try:
+            # ⚡ Generate fast image via open API
+            _sd_generate_image(spec["prompt"], out_path, title=plan.blog_title, subtitle=spec.get("alt", ""))
+
+            img_md = f"""
+<p align="center">
+  <img src="images/{filename}" width="600"/>
+</p>
+<p align="center"><em>{spec['caption']}</em></p>
+"""
+            
+            # Place after the target heading
+            if heading and f"## {heading}" in md:
+                md = md.replace(f"## {heading}", f"## {heading}\n\n{img_md}\n\n")
+            else:
+                # Fallback: put it at the very top under the H1
+                md = re.sub(r"(# .*?\n)", rf"\1\n{img_md}\n\n", md, count=1)
+
+        except Exception as e:
+            # graceful fallback (no blocking)
+            print(f"Image generation failed: {e}")
+
+    filename = f"{plan.blog_title}.md"
+    Path(filename).write_text(md, encoding="utf-8")
+    return {"final": md}
+    
+# build reducer subgraph
+reducer_graph = StateGraph(State)
+reducer_graph.add_node("merge_content", merge_content)
+reducer_graph.add_node("decide_images", decide_images)
+reducer_graph.add_node("generate_and_place_images", generate_and_place_images)
+reducer_graph.add_edge(START, "merge_content")
+reducer_graph.add_edge("merge_content", "decide_images")
+reducer_graph.add_edge("decide_images", "generate_and_place_images")
+reducer_graph.add_edge("generate_and_place_images", END)
+reducer_subgraph = reducer_graph.compile()
+
+reducer_subgraph
+
+# -----------------------------
+# 9) Build graph
+# -----------------------------
+# -----------------------------
+# 9) Build main graph
+# -----------------------------
+g = StateGraph(State)
+g.add_node("router", router_node)
+g.add_node("research", research_node)
+g.add_node("orchestrator", orchestrator_node)
+g.add_node("worker", worker_node)
+g.add_node("reducer", reducer_subgraph)
+
+g.add_edge(START, "router")
+g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
+g.add_edge("research", "orchestrator")
+
+g.add_conditional_edges("orchestrator", fanout)
+g.add_edge("worker", "reducer")
+g.add_edge("reducer", END)
+
+app = g.compile()
+app
+
+# -----------------------------
+# 10) Runner
+# FIX: Always pass ALL required State keys to app.invoke()
+# Missing keys cause KeyError inside nodes.
+# -----------------------------
+def run(topic: str):
+    out = app.invoke(
+        {
+            "topic": topic,
+            "mode": "",           # will be set by router_node
+            "needs_research": False,
+            "queries": [],
+            "evidence": [],
+            "plan": None,
+            "sections": [],
+            "merged_md": "",
+            "md_with_placeholders": "",
+            "image_specs": [],
+            "final": "",
+        }
+    )
+    return out
 
 
-# ── Build Graph ───────────────────────────────────────────────────────────────
-
-def _should_research(state: BlogState) -> str:
-    return "research" if state.get("needs_research") else "orchestrator"
-
-
-workflow = StateGraph(BlogState)
-
-workflow.add_node("router", router_node)
-workflow.add_node("research", research_node)
-workflow.add_node("orchestrator", orchestrator_node)
-workflow.add_node("worker", worker_node)
-workflow.add_node("reducer", reducer_node)
-workflow.add_node("image", image_node)
-
-workflow.set_entry_point("router")
-workflow.add_conditional_edges("router", _should_research, {
-    "research": "research",
-    "orchestrator": "orchestrator",
-})
-workflow.add_edge("research", "orchestrator")
-workflow.add_edge("orchestrator", "worker")
-workflow.add_edge("worker", "reducer")
-workflow.add_edge("reducer", "image")
-workflow.add_edge("image", END)
-
-app = workflow.compile()
+# FIX: Last cell — use run() helper which initialises all required state keys.
+if __name__ == "__main__":
+    result=run("Self Attention in Transformer Architecture")
+    print(result["final"])
