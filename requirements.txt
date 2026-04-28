@@ -1,0 +1,11 @@
+streamlit
+langchain
+langgraph
+langchain-groq
+langchain-community
+tavily-python
+pydantic
+python-dotenv
+requests
+pillow
+pandas
