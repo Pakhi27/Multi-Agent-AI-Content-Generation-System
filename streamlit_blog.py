@@ -589,8 +589,9 @@ if run_btn:
         "final": "",
     }
 
-    progress = st.progress(0)
-    status = st.empty()
+   with tab_preview:
+        progress = st.progress(0)
+        status = st.empty()
 
     status.markdown(
         '<p style="font-size:0.85rem;color:#7a7f8e;">⚙️ Initialising pipeline…</p>',
