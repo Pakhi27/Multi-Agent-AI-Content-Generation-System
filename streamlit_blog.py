@@ -589,7 +589,7 @@ if run_btn:
         "final": "",
     }
 
-   with tab_preview:
+ with tab_preview:
         progress = st.progress(0)
         status = st.empty()
 
