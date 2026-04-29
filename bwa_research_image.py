@@ -664,32 +664,60 @@ def add_text_overlay(image: Image.Image, title: str, subtitle: str = ""):
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    try:
-        font_title = ImageFont.truetype("arial.ttf", 60)
-        font_sub = ImageFont.truetype("arial.ttf", 35)
-    except Exception:
-        font_title = ImageFont.load_default()
-        font_sub = ImageFont.load_default()
-
     W, H = image.size
-    overlay_height = int(H * 0.35)
+    overlay_height = int(H * 0.40)  # slightly taller bar
 
-    draw.rectangle(
-        [(0, H - overlay_height), (W, H)],
-        fill=(0, 0, 0, 180)
-    )
-    draw.text((50, H - overlay_height + 40), title, font=font_title, fill=(255, 255, 255, 255))
+    # Try common fonts available on Linux/Mac/Windows
+    font_paths_title = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",   # Linux
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",                     # macOS
+        "C:/Windows/Fonts/arialbd.ttf",                            # Windows
+        "arial.ttf",
+    ]
+    font_paths_sub = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "C:/Windows/Fonts/arial.ttf",
+        "arial.ttf",
+    ]
+
+    def load_font(paths, size):
+        for p in paths:
+            try:
+                return ImageFont.truetype(p, size)
+            except:
+                continue
+        # Last resort: default (will be small but at least won't crash)
+        return ImageFont.load_default()
+
+    font_title = load_font(font_paths_title, 54)
+    font_sub   = load_font(font_paths_sub, 32)
+
+    # Dark gradient bar at bottom
+    draw.rectangle([(0, H - overlay_height), (W, H)], fill=(0, 0, 0, 190))
+
+    # Wrap title text so it doesn't overflow
+    margin = 60
+    max_chars = int(W / 28)  # rough chars per line at font size 54
+    wrapped_title = textwrap.fill(title, width=max_chars)
+
+    draw.text((margin, H - overlay_height + 30), wrapped_title,
+              font=font_title, fill=(255, 255, 255, 255))
+
     if subtitle:
-        draw.text((50, H - overlay_height + 120), subtitle, font=font_sub, fill=(220, 220, 220, 255))
+        wrapped_sub = textwrap.fill(subtitle, width=int(W / 18))
+        draw.text((margin, H - overlay_height + 140), wrapped_sub,
+                  font=font_sub, fill=(220, 220, 220, 220))
 
     combined = Image.alpha_composite(image, overlay)
     return combined.convert("RGB")
 
-
 def _sd_generate_image(prompt: str, output_path: Path, title: str = "", subtitle: str = ""):
     try:
         img = generate_flux_image(prompt)
-        short_title = " ".join(title.split()[:5])
+        short_title = title
         img = add_text_overlay(img, short_title, subtitle)
         img.save(output_path, quality=95)
     except Exception as e:
