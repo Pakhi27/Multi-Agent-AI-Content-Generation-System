@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-import json
 import operator
-import re
-import os
-import urllib.parse
-import requests
-from io import BytesIO
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
+from unittest import result
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field,field_validator
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
@@ -19,11 +14,12 @@ from langgraph.types import Send
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_community.tools.tavily_search import TavilySearchResults
-
-from PIL import Image, ImageDraw, ImageFont
+import os
+import urllib.parse
+import requests
+from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env file
-
 
 # -----------------------------
 # 1) Schemas
@@ -41,7 +37,7 @@ class Task(BaseModel):
         max_length=4,
         description="3–4 concrete, non-overlapping subpoints to cover in this section.",
     )
-    target_words: int = Field(..., description="Target word count for this section (350–600).")
+    target_words: int = Field(..., description="Target word count for this section (150–350).")
     tags: List[str] = Field(default_factory=list)
     requires_research: bool = False
     requires_citations: bool = False
@@ -54,7 +50,7 @@ class Plan(BaseModel):
     tone: str
     blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
     constraints: List[str] = Field(default_factory=list)
-    tasks: List[Task] = Field(..., min_length=6, max_length=6)
+    tasks: List[Task] = Field(..., min_length=4, max_length=6)
 
 
 class EvidenceItem(BaseModel):
@@ -106,6 +102,7 @@ class State(TypedDict):
     final: str
 
 
+
 # -----------------------------
 # 2b) Worker subgraph state
 # Note: Send() passes a dict that becomes the node's state.
@@ -118,6 +115,8 @@ class WorkerState(TypedDict):
     plan: dict
     evidence: List[dict]
 
+
+load_dotenv()
 
 llm_strong = ChatGroq(
     model="llama-3.3-70b-versatile",
@@ -136,7 +135,6 @@ llm_worker = ChatGroq(
     temperature=0.3,
     max_retries=5
 )
-
 
 # -----------------------------
 # 3) Router
@@ -198,7 +196,6 @@ def _clean_snippet(text: str, max_len: int = 200) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text[:max_len]
 
-
 def _tavily_search(query: str, max_results: int = 3) -> List[dict]:
     tool = TavilySearchResults(max_results=max_results)
     response = tool.invoke({"query": query})
@@ -210,7 +207,7 @@ def _tavily_search(query: str, max_results: int = 3) -> List[dict]:
             normalized.append({
                 "title": (r.get("title") or "")[:80],
                 "url": r.get("url") or "",
-                "snippet": _clean_snippet(r.get("content") or r.get("snippet") or ""),
+                 "snippet": _clean_snippet(r.get("content") or r.get("snippet") or ""),
                 "published_at": r.get("published_date") or r.get("published_at"),
                 "source": r.get("source"),
             })
@@ -227,58 +224,15 @@ Rules:
 - Avoid low-authority recap sites unless nothing better exists.
 - If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
   If missing or unclear, set published_at=null. Do NOT guess.
-- Keep snippets short (under 200 characters). Do NOT include code snippets or escape characters in snippets.
+- Keep snippets short.
 - Deduplicate by URL.
 
-You MUST respond with a JSON object that EXACTLY matches this structure — no extra keys, no missing keys:
-
-{
-  "evidence": [
-    {
-      "title": "Page or article title",
-      "url": "https://example.com/page",
-      "published_at": null,
-      "snippet": "Short plain-text summary under 200 chars.",
-      "source": "example.com"
-    }
-  ]
-}
-
-CRITICAL:
-- The list MUST be called "evidence" — NOT "evidence_items", "items", "results", or any other name.
-- Every item MUST have: title, url, published_at, snippet, source.
-- Snippets must be plain text only — no code, no escape sequences, no markdown.
-- Respond in JSON format only. No markdown, no preamble.
+Respond in JSON format.
 """
 
 
-def _fix_evidence_dict(data: dict) -> dict:
-    """Auto-correct common LLM schema mistakes in EvidencePack output."""
-    # Fix: LLM used wrong key name for the list
-    for wrong_key in ("evidence_items", "items", "results", "sources", "documents"):
-        if wrong_key in data and "evidence" not in data:
-            data["evidence"] = data.pop(wrong_key)
-            break
-
-    # Fix: missing fields on individual evidence items
-    for item in data.get("evidence", []):
-        item.setdefault("title", "")
-        item.setdefault("published_at", None)
-        item.setdefault("snippet", None)
-        item.setdefault("source", None)
-
-        # Fix: strip code/escape sequences from snippets (root cause of malformed JSON)
-        if item.get("snippet"):
-            snippet = item["snippet"]
-            snippet = re.sub(r"\\[ntr\\\"']", " ", snippet)   # unescape sequences
-            snippet = re.sub(r"\s+", " ", snippet).strip()
-            item["snippet"] = snippet[:200]
-
-    return data
-
-
 def research_node(state: State) -> dict:
-    queries = (state.get("queries") or [])[:3]
+    queries = (state.get("queries") or [])[:3]   # max 3 queries
     raw_results: List[dict] = []
     for q in queries:
         raw_results.extend(_tavily_search(q, max_results=3))
@@ -286,37 +240,20 @@ def research_node(state: State) -> dict:
     if not raw_results:
         return {"evidence": []}
 
+    # Hard cap at 10 results total before sending to LLM
     raw_results = raw_results[:10]
-
-    formatted_results = "\n\n".join([
+    
+    formatted_results = "\n\n".join(
+    [
         f"Title: {r['title']}\nURL: {r['url']}\nPublished: {r.get('published_at')}\nSnippet: {r.get('snippet')}"
         for r in raw_results
+    ]
+)
+    extractor = llm_fast.with_structured_output(EvidencePack, method="json_mode")
+    pack = extractor.invoke([
+        SystemMessage(content=RESEARCH_SYSTEM),
+        HumanMessage(content=f"Raw search results:\n\n{formatted_results}"),
     ])
-
-    # Use raw json_mode + manual fix instead of with_structured_output
-    raw_llm = llm_fast.bind(response_format={"type": "json_object"})
-
-    try:
-        response = raw_llm.invoke([
-            SystemMessage(content=RESEARCH_SYSTEM),
-            HumanMessage(content=f"Raw search results:\n\n{formatted_results}"),
-        ])
-        raw = json.loads(response.content)
-        fixed = _fix_evidence_dict(raw)
-        pack = EvidencePack.model_validate(fixed)
-    except Exception as e:
-        print(f"✕ Research node parse error: {e} — falling back to direct extraction")
-        # Fallback: build EvidencePack directly from raw Tavily results, skip LLM
-        pack = EvidencePack(evidence=[
-            EvidenceItem(
-                title=r.get("title") or "",
-                url=r["url"],
-                published_at=r.get("published_at"),
-                snippet=(r.get("snippet") or "")[:200],
-                source=r.get("source"),
-            )
-            for r in raw_results if r.get("url")
-        ])
 
     dedup = {}
     for e in pack.evidence:
@@ -325,127 +262,41 @@ def research_node(state: State) -> dict:
 
     return {"evidence": list(dedup.values())}
 
-
 # -----------------------------
 # 5) Orchestrator
-# FIX: Force 6 sections + higher word counts
 # -----------------------------
-ORCH_SYSTEM = """You are a technical blog planner. Produce a detailed, comprehensive outline.
+ORCH_SYSTEM = """You are a technical blog planner. Produce a concise outline.
 
 Rules:
-- Create EXACTLY 6 sections — no fewer, no more.
-- Each section: goal (1 sentence), 3–4 bullets, target_words 350–600.
-- Include at least 2 sections with requires_code=true for richer technical depth.
+- Create EXACTLY 4–6 sections (no more than 6).
+- Each section: goal (1 sentence), 3–4 bullets, target_words 150–350.
+- Include at least 1 section with requires_code=True.
 - closed_book: evergreen content only.
-- hybrid: use evidence for examples; set requires_citations=true on those sections.
+- hybrid: use evidence for examples; set requires_citations=True on those sections.
 - open_book: blog_kind="news_roundup", summarize events with evidence URLs.
 
-You MUST respond with a JSON object that EXACTLY matches this structure — no extra keys, no missing keys:
-
-{
-  "blog_title": "A compelling title for the blog post",
-  "audience": "e.g. intermediate Python developers",
-  "tone": "e.g. technical but approachable",
-  "blog_kind": "explainer",
-  "constraints": [],
-  "tasks": [
-    {
-      "id": 1,
-      "title": "Section Title Here",
-      "goal": "One sentence describing what the reader learns.",
-      "bullets": ["point 1", "point 2", "point 3"],
-      "target_words": 400,
-      "tags": [],
-      "requires_research": false,
-      "requires_citations": false,
-      "requires_code": false
-    }
-  ]
-}
-
-CRITICAL RULES:
-- The list MUST be called "tasks" — NOT "sections".
-- Every task MUST include all fields: id, title, goal, bullets, target_words, tags, requires_research, requires_citations, requires_code.
-- blog_title, audience, and tone are REQUIRED at the top level — never omit them.
-- blog_kind must be one of: explainer, tutorial, news_roundup, comparison, system_design.
-- target_words for each section MUST be between 350 and 600.
-- Do NOT add any extra fields beyond what is shown above.
-- Respond in JSON format only.
+Output must strictly match the Plan schema. Respond in JSON format.
 """
 
 
-def _fix_plan_dict(data: dict) -> dict:
-    """Auto-correct common LLM schema mistakes before Pydantic validation."""
-
-    # Fix: LLM used "sections" instead of "tasks"
-    if "sections" in data and "tasks" not in data:
-        data["tasks"] = data.pop("sections")
-
-    # Fix: missing top-level fields
-    data.setdefault("blog_title", "Untitled Post")
-    data.setdefault("audience", "general technical audience")
-    data.setdefault("tone", "informative and clear")
-    data.setdefault("blog_kind", "explainer")
-    data.setdefault("constraints", [])
-
-    # Fix: ensure exactly 6 tasks by duplicating/trimming if needed
-    tasks = data.get("tasks", [])
-    # Trim to 6 if over
-    if len(tasks) > 6:
-        data["tasks"] = tasks[:6]
-
-    # Fix: task-level missing/extra fields
-    allowed_task_keys = {
-        "id", "title", "goal", "bullets", "target_words",
-        "tags", "requires_research", "requires_citations", "requires_code"
-    }
-    for i, task in enumerate(data.get("tasks", [])):
-        task.setdefault("id", i + 1)
-        task.setdefault("title", f"Section {i + 1}")
-        task.setdefault("tags", [])
-        task.setdefault("requires_research", False)
-        task.setdefault("requires_citations", False)
-        task.setdefault("requires_code", False)
-
-        # Enforce minimum target_words of 350
-        if task.get("target_words", 0) < 350:
-            task["target_words"] = 400
-
-        # Remove unknown fields like "blog_kind" that sometimes sneak into tasks
-        for key in list(task.keys()):
-            if key not in allowed_task_keys:
-                task.pop(key)
-
-    return data
-
-
 def orchestrator_node(state: State) -> dict:
+    planner = llm_strong.with_structured_output(Plan, method="json_mode")
     evidence = state.get("evidence") or []
     mode = state.get("mode") or "closed_book"
 
-    # Use raw json_mode so we get the string back and can fix it before validation
-    raw_llm = llm_strong.bind(response_format={"type": "json_object"})
-
-    response = raw_llm.invoke([
-        SystemMessage(content=ORCH_SYSTEM),
-        HumanMessage(
-            content=(
-                f"Topic: {state['topic']}\n"
-                f"Mode: {mode}\n\n"
-                f"Evidence (ONLY use for fresh claims; may be empty):\n"
-                f"{[e.model_dump() for e in evidence][:16]}"
-            )
-        ),
-    ])
-
-    try:
-        raw = json.loads(response.content)
-        fixed = _fix_plan_dict(raw)
-        plan = Plan.model_validate(fixed)
-    except Exception as e:
-        print(f"✕ Error: Failed to parse Plan — {e}\nRaw output: {response.content}")
-        raise
-
+    plan = planner.invoke(
+        [
+            SystemMessage(content=ORCH_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"Mode: {mode}\n\n"
+                    f"Evidence (ONLY use for fresh claims; may be empty):\n"
+                    f"{[e.model_dump() for e in evidence][:16]}"
+                )
+            ),
+        ]
+    )
     return {"plan": plan}
 
 
@@ -477,9 +328,7 @@ Write ONE section of a technical blog post in Markdown.
 
 Hard constraints:
 - Follow the provided Goal and cover ALL Bullets in order (do not skip or merge bullets).
-- You MUST write AT LEAST the Target words count. Do not stop early.
-  Expand each bullet into 2–3 full paragraphs with concrete detail, examples, and explanations.
-  Going 10–20% over target is acceptable and encouraged; going under is NOT acceptable.
+- Stay close to Target words (±15%).
 - Output ONLY the section content in Markdown (no blog title H1, no extra commentary).
 - Start with a '## <Section Title>' heading.
 
@@ -498,21 +347,20 @@ Grounding policy:
 
 Code:
 - If requires_code == true, include at least one minimal, correct code snippet relevant to the bullets.
-  Add a second code snippet if it meaningfully illustrates a different sub-concept.
 
-Depth guidelines:
-- Write short, dense paragraphs (3–5 sentences each).
-- Use bullet lists sparingly — prefer prose that flows logically.
-- Every paragraph must introduce a new technical idea or deepen the previous one.
+Style:
+- Short paragraphs, bullets where helpful, code fences for code.
+- Avoid fluff/marketing. Be precise and implementation-oriented.
+- Every paragraph must add a new technical idea.
 - Avoid repeating definitions already covered in earlier sections.
-- Prefer concrete examples, worked scenarios, and edge cases over abstract wording.
+- Prefer concrete examples over abstract wording.
 - Use short code comments only when they improve understanding.
 - Do not write generic transition sentences like "In today's world" or "This is very important."
-- Write as if explaining to a developer who will implement this after reading.
-- When introducing a formula, explain what it means operationally and give a numeric example.
+- Write as if explaining to a developer who may implement this after reading.
+- When introducing a formula, explain what it means operationally.
 - When describing a failure mode, mention how to detect or debug it.
-- When discussing a concept, compare it to an alternative to build intuition.
 """
+
 
 
 def worker_node(state: WorkerState) -> dict:
@@ -545,8 +393,7 @@ def worker_node(state: WorkerState) -> dict:
                     f"Mode: {mode}\n\n"
                     f"Section title: {task.title}\n"
                     f"Goal: {task.goal}\n"
-                    f"Target words: {task.target_words} (MINIMUM — do not write less than this. "
-                    f"Expand each bullet into multiple detailed paragraphs to reach this count.)\n"
+                    f"Target words: {task.target_words}\n"
                     f"Tags: {task.tags}\n"
                     f"requires_research: {task.requires_research}\n"
                     f"requires_citations: {task.requires_citations}\n"
@@ -562,7 +409,7 @@ def worker_node(state: WorkerState) -> dict:
 
 
 # -----------------------------
-# 8) Reducer schemas
+# 8) Reducer
 # -----------------------------
 class ImageSpec(BaseModel):
     filename: str = Field(..., description="Save under images/, e.g. qkv_flow.png")
@@ -577,11 +424,16 @@ class ImageSpec(BaseModel):
 class GlobalImagePlan(BaseModel):
     images: List[ImageSpec] = Field(default_factory=list)
 
-
 # ============================================================
 # 8) ReducerWithImages (subgraph)
 #    merge_content -> decide_images -> generate_and_place_images
 # ============================================================
+# ============================================================
+#  FAST ReducerWithImages (SDXL-TURBO OPTIMIZED)
+# ============================================================
+
+from pathlib import Path
+import os
 
 # -------------------------------
 # 1. Merge Content
@@ -591,13 +443,13 @@ def merge_content(state: State) -> dict:
 
     ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
     body = "\n\n".join(ordered_sections).strip()
-
+    
     # Strip LLM markdown wrapping if present
     if body.startswith("```markdown"):
         body = body[11:]
     if body.endswith("```"):
         body = body[:-3]
-
+        
     merged_md = f"# {plan.blog_title}\n\n{body}\n"
 
     return {"merged_md": merged_md}
@@ -606,17 +458,26 @@ def merge_content(state: State) -> dict:
 # -------------------------------
 # 2. Decide Images (LIMITED TO 2)
 # -------------------------------
-DECIDE_IMAGES_SYSTEM = """You are an expert technical editor and art director.
 
-Rules for Images:
-- Max 2 images only.
-- DO NOT request diagrams with text, arrows, or flowcharts (AI image models fail at generating legible text/diagrams).
-- Instead, request high-quality, abstract, minimalist vector art or conceptual isometric illustrations that visually represent the technical concepts.
-- The prompt MUST be highly descriptive and specify styles like "minimalist, sleek, modern tech, isometric, vector art, vibrant colors".
+DECIDE_IMAGES_SYSTEM = """You are an expert technical art director for a high-end developer blog.
 
-Return strictly GlobalImagePlan.
+Your job: plan exactly 2 striking hero images for the blog post.
+
+STRICT RULES:
+- Exactly 2 images. No more, no less.
+- NO text, NO labels, NO arrows, NO diagrams, NO flowcharts in the image — AI image models cannot render readable text.
+- Each image prompt must be 40-80 words, highly descriptive, specifying:
+    * The core visual metaphor (e.g. "interconnected glowing neural nodes floating in dark space")
+    * Art style: "photorealistic 3D render" OR "cinematic isometric illustration" OR "abstract neon concept art"
+    * Color palette: e.g. "deep navy and electric blue with gold highlights"
+    * Mood/lighting: e.g. "dramatic rim lighting, volumetric fog"
+    * Quality boosters: "ultra-detailed, 8k resolution, professional studio quality"
+- The `target_heading` must exactly match one of the ## section headings in the blog (copy it verbatim).
+- First image: hero banner concept representing the overall topic.
+- Second image: a mid-article visual representing a specific technical sub-concept.
+
+Return strictly GlobalImagePlan JSON.
 """
-
 
 def decide_images(state: State) -> dict:
     planner = llm_fast.with_structured_output(GlobalImagePlan)
@@ -625,38 +486,68 @@ def decide_images(state: State) -> dict:
         SystemMessage(content=DECIDE_IMAGES_SYSTEM),
         HumanMessage(content=state["merged_md"]),
     ])
-
+    
     images = image_plan.images
 
-    # Force at least 1 image
+    # 🔥 force at least 1 image
     if not images:
         images = [ImageSpec(
-            filename="diagram.png",
-            alt="diagram",
-            caption="Generated diagram",
-            prompt="simple technical diagram",
-            target_heading="",
-        )]
+        filename="diagram.png",
+        alt="diagram",
+        caption="Generated diagram",
+        prompt="simple technical diagram",
+        target_heading="",
+    )]
 
     return {
-        "md_with_placeholders": state["merged_md"],  # Legacy field, kept for state compatibility
+        "md_with_placeholders": state["merged_md"], # Legacy field, kept for state compatibility
         "image_specs": [img.model_dump() for img in images[:2]],  # force max 2
     }
+   
 
 
 # -------------------------------
-# Image generation helpers (Flux + Pillow text overlay)
+#  BEST FREE IMAGE PIPELINE (FLUX + PRO TEXT OVERLAY)
 # -------------------------------
+
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
+import textwrap
+
+
 def generate_flux_image(prompt: str):
-    encoded_prompt = urllib.parse.quote(prompt)
-    # 1280x720 gives a good blog banner ratio
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-        f"?width=1280&height=720&model=flux&enhance=true&nologo=true"
+    """
+    Generate a high-quality image via Pollinations.ai using the flux-pro model.
+    Falls back to flux if flux-pro fails.
+    """
+    # Enrich prompt for technical blog quality
+    enriched_prompt = (
+        f"{prompt}, "
+        "ultra-detailed, professional technical illustration, "
+        "dark background, vibrant accent colors, minimalist modern design, "
+        "8k, sharp focus, no text, no watermark"
     )
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
-    return Image.open(BytesIO(response.content)).convert("RGBA")
+    encoded_prompt = urllib.parse.quote(enriched_prompt)
+
+    models_to_try = ["flux-pro", "flux"]
+    last_exc = None
+
+    for model in models_to_try:
+        try:
+            url = (
+                f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+                f"?width=1280&height=720&model={model}&enhance=true&nologo=true&seed={hash(prompt) % 99999}"
+            )
+            response = requests.get(url, timeout=90)
+            response.raise_for_status()
+            img = Image.open(BytesIO(response.content)).convert("RGBA")
+            print(f"Image generated with model: {model}")
+            return img
+        except Exception as e:
+            last_exc = e
+            print(f"Model {model} failed: {e}, trying next…")
+
+    raise RuntimeError(f"All image models failed. Last error: {last_exc}")
 
 
 def add_text_overlay(image: Image.Image, title: str, subtitle: str = ""):
@@ -664,76 +555,56 @@ def add_text_overlay(image: Image.Image, title: str, subtitle: str = ""):
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
+    try:
+        font_title = ImageFont.truetype("arial.ttf", 60)
+        font_sub = ImageFont.truetype("arial.ttf", 35)
+    except:
+        font_title = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
+
     W, H = image.size
-    overlay_height = int(H * 0.40)  # slightly taller bar
+    overlay_height = int(H * 0.35)
 
-    # Try common fonts available on Linux/Mac/Windows
-    font_paths_title = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",   # Linux
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",                     # macOS
-        "C:/Windows/Fonts/arialbd.ttf",                            # Windows
-        "arial.ttf",
-    ]
-    font_paths_sub = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "C:/Windows/Fonts/arial.ttf",
-        "arial.ttf",
-    ]
+    draw.rectangle(
+        [(0, H - overlay_height), (W, H)],
+        fill=(0, 0, 0, 180)
+    )
 
-    def load_font(paths, size):
-        for p in paths:
-            try:
-                return ImageFont.truetype(p, size)
-            except:
-                continue
-        # Last resort: default (will be small but at least won't crash)
-        return ImageFont.load_default()
-
-    font_title = load_font(font_paths_title, 54)
-    font_sub   = load_font(font_paths_sub, 32)
-
-    # Dark gradient bar at bottom
-    draw.rectangle([(0, H - overlay_height), (W, H)], fill=(0, 0, 0, 190))
-
-    # Wrap title text so it doesn't overflow
-    margin = 60
-    max_chars = int(W / 28)  # rough chars per line at font size 54
-    wrapped_title = textwrap.fill(title, width=max_chars)
-
-    draw.text((margin, H - overlay_height + 30), wrapped_title,
-              font=font_title, fill=(255, 255, 255, 255))
+    draw.text((50, H - overlay_height + 40), title, font=font_title, fill=(255, 255, 255, 255))
 
     if subtitle:
-        wrapped_sub = textwrap.fill(subtitle, width=int(W / 18))
-        draw.text((margin, H - overlay_height + 140), wrapped_sub,
-                  font=font_sub, fill=(220, 220, 220, 220))
+        draw.text((50, H - overlay_height + 120), subtitle, font=font_sub, fill=(220, 220, 220, 255))
 
     combined = Image.alpha_composite(image, overlay)
     return combined.convert("RGB")
 
+
 def _sd_generate_image(prompt: str, output_path: Path, title: str = "", subtitle: str = ""):
     try:
         img = generate_flux_image(prompt)
-        short_title = title
+
+        # 🔥 SHORT TITLE for image (important improvement)
+        short_title = " ".join(title.split()[:5])
+
         img = add_text_overlay(img, short_title, subtitle)
         img.save(output_path, quality=95)
+
     except Exception as e:
         print(f"Image generation failed: {e}")
 
+import re
 
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', "_", name)
     name = name.replace("–", "-").replace("—", "-").strip().strip(".")
     return name or "output"
-
-
+    
 # -------------------------------
-# 3. Generate + Place Images
+# 4. Generate + Place Images
 # -------------------------------
+
 def generate_and_place_images(state: State) -> dict:
+
     plan = state["plan"]
 
     md = state.get("md_with_placeholders") or state["merged_md"]
@@ -741,7 +612,7 @@ def generate_and_place_images(state: State) -> dict:
 
     # Skip images if none
     if not image_specs:
-        filename = f"{sanitize_filename(plan.blog_title)}.md"
+        filename = f"{plan.blog_title}.md"
         Path(filename).write_text(md, encoding="utf-8")
         return {"final": md}
 
@@ -754,36 +625,32 @@ def generate_and_place_images(state: State) -> dict:
         heading = spec.get("target_heading", "")
 
         try:
-            _sd_generate_image(
-                spec["prompt"],
-                out_path,
-                title=plan.blog_title,
-                subtitle=spec.get("alt", "")
-            )
+            # ⚡ Generate fast image via open API
+            _sd_generate_image(spec["prompt"], out_path, title=plan.blog_title, subtitle=spec.get("alt", ""))
 
-            img_md = (
-                f'\n<p align="center">\n'
-                f'  <img src="images/{filename}" width="600"/>\n'
-                f"</p>\n"
-                f'<p align="center"><em>{spec["caption"]}</em></p>\n'
-            )
-
+            img_md = f"""
+<p align="center">
+  <img src="images/{filename}" width="600"/>
+</p>
+<p align="center"><em>{spec['caption']}</em></p>
+"""
+            
             # Place after the target heading
             if heading and f"## {heading}" in md:
                 md = md.replace(f"## {heading}", f"## {heading}\n\n{img_md}\n\n")
             else:
-                # Fallback: put it at the top under the H1
+                # Fallback: put it at the very top under the H1
                 md = re.sub(r"(# .*?\n)", rf"\1\n{img_md}\n\n", md, count=1)
 
         except Exception as e:
+            # graceful fallback (no blocking)
             print(f"Image generation failed: {e}")
 
-    out_filename = f"{sanitize_filename(plan.blog_title)}.md"
-    Path(out_filename).write_text(md, encoding="utf-8")
+    filename = f"{plan.blog_title}.md"
+    Path(filename).write_text(md, encoding="utf-8")
     return {"final": md}
-
-
-# Build reducer subgraph
+    
+# build reducer subgraph
 reducer_graph = StateGraph(State)
 reducer_graph.add_node("merge_content", merge_content)
 reducer_graph.add_node("decide_images", decide_images)
@@ -794,7 +661,11 @@ reducer_graph.add_edge("decide_images", "generate_and_place_images")
 reducer_graph.add_edge("generate_and_place_images", END)
 reducer_subgraph = reducer_graph.compile()
 
+reducer_subgraph
 
+# -----------------------------
+# 9) Build graph
+# -----------------------------
 # -----------------------------
 # 9) Build main graph
 # -----------------------------
@@ -808,21 +679,24 @@ g.add_node("reducer", reducer_subgraph)
 g.add_edge(START, "router")
 g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
 g.add_edge("research", "orchestrator")
+
 g.add_conditional_edges("orchestrator", fanout)
 g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 
 app = g.compile()
-
+app
 
 # -----------------------------
 # 10) Runner
+# FIX: Always pass ALL required State keys to app.invoke()
+# Missing keys cause KeyError inside nodes.
 # -----------------------------
 def run(topic: str):
     out = app.invoke(
         {
             "topic": topic,
-            "mode": "",            # will be set by router_node
+            "mode": "",           # will be set by router_node
             "needs_research": False,
             "queries": [],
             "evidence": [],
@@ -837,6 +711,7 @@ def run(topic: str):
     return out
 
 
+# FIX: Last cell — use run() helper which initialises all required state keys.
 if __name__ == "__main__":
-    result = run("Self Attention in Transformer Architecture")
+    result=run("Self Attention in Transformer Architecture")
     print(result["final"])
