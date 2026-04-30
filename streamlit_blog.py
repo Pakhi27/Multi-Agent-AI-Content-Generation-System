@@ -515,10 +515,12 @@ with st.sidebar:
     run_btn = st.button("✦  Generate Blog", use_container_width=True)
 
     st.markdown('<div class="sidebar-label">Past Blogs</div>', unsafe_allow_html=True)
-    files = list(Path(".").glob("*.md"))
+    # Exclude README.md, CHANGELOG.md and other non-blog files
+    EXCLUDED_MD = {"readme.md", "changelog.md", "license.md", "contributing.md"}
+    files = [f for f in Path(".").glob("*.md") if f.name.lower() not in EXCLUDED_MD]
 
     if files:
-        selected = st.selectbox("Select blog", files, label_visibility="collapsed")
+        selected = st.selectbox("Select blog", files, format_func=lambda f: f.stem.replace("_", " ").title(), label_visibility="collapsed")
         if st.button("Load Blog", use_container_width=True):
             st.session_state["last_out"] = {
                 "final": selected.read_text(encoding="utf-8"),
@@ -526,6 +528,7 @@ with st.sidebar:
                 "evidence": [],
                 "image_specs": []
             }
+            st.rerun()
     else:
         st.markdown(
             '<p style="font-size:0.8rem;color:#4a4f5e;margin-top:0.3rem;">No saved blogs yet</p>',
@@ -589,9 +592,8 @@ if run_btn:
         "final": "",
     }
 
-    gen_container = st.empty()
-
-    with gen_container.container():
+    gen_area = st.empty()
+    with gen_area.container():
         progress = st.progress(0)
         status = st.empty()
         status.markdown(
@@ -600,26 +602,19 @@ if run_btn:
         )
 
     try:
-        with gen_container.container():
+        with gen_area.container():
             with st.spinner("Generating your blog — this takes 1–2 minutes…"):
                 out = app.invoke(inputs)
 
-        # Clear everything — no ghost box left behind
-        gen_container.empty()
+        # Wipe the spinner/progress container completely — no ghost box
+        gen_area.empty()
         st.session_state["last_out"] = out
-        st.session_state["gen_success"] = True
+        st.toast("✓ Blog generated successfully!", icon="✅")
+        st.rerun()
 
     except Exception as e:
-        gen_container.empty()
-        st.session_state["gen_error"] = str(e)
-
-# Show success / error banners (survive the rerun, but outside any container)
-if st.session_state.pop("gen_success", False):
-    st.toast("✓ Blog generated successfully!", icon="✅")
-
-if "gen_error" in st.session_state:
-    err = st.session_state.pop("gen_error")
-    st.error(f"✕ Error: {err}")
+        gen_area.empty()
+        st.error(f"✕ Error: {e}")
 
 # -----------------------------
 # Render Output
@@ -632,57 +627,58 @@ if out:
     # ── Blog Preview ──
     with tab_preview:
         if final_md:
-            # Use st.container so st.image() renders correctly alongside markdown.
-            # Apply blog-wrap styling via CSS targeting the container's inner div.
-            st.markdown("""
-            <style>
-            [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"] > div:first-child {
-                background: var(--bg-card) !important;
-                border-radius: var(--radius-lg) !important;
-                padding: 3rem 3.5rem !important;
-                line-height: 1.85 !important;
-                max-width: 780px !important;
-                margin: 0 auto 2rem !important;
-            }
-            </style>
-            """, unsafe_allow_html=True)
+            # Pre-process: strip all <p align="center"><img ...></p> and ![...](...) blocks
+            # so we can render images via st.image() and the rest as markdown.
+            # This regex captures: bare markdown images, bare <img> tags,
+            # AND <p align="center">...<img ...>...</p> wrappers (what the pipeline produces).
+            IMAGE_BLOCK_RE = re.compile(
+                r"(<p[^>]*>\s*<img\s[^>]*src=[\"']images/([^\"']+)[\"'][^>]*/?>.*?</p>)"
+                r"|(<img\s[^>]*src=[\"']images/([^\"']+)[\"'][^>]*/?>\s*(?:<p[^>]*>.*?</p>)?)"
+                r"|(!\[([^\]]*)\]\(images/([^\)]+)\))",
+                re.DOTALL | re.IGNORECASE
+            )
+
+            def extract_caption(block: str) -> str:
+                """Pull caption from <em>...</em> near the image block."""
+                m = re.search(r'<em>(.*?)</em>', block, re.DOTALL)
+                return m.group(1).strip() if m else ""
+
+            # Split the markdown into text chunks and image blocks
+            parts = []
+            last = 0
+            for m in IMAGE_BLOCK_RE.finditer(final_md):
+                if m.start() > last:
+                    parts.append(("text", final_md[last:m.start()]))
+                block = m.group(0)
+                # Determine image path
+                img_path = m.group(2) or m.group(4) or m.group(7) or ""
+                caption = extract_caption(block) or m.group(6) or ""
+                parts.append(("image", f"images/{img_path}", caption))
+                last = m.end()
+            if last < len(final_md):
+                parts.append(("text", final_md[last:]))
 
             with st.container(border=True):
-                parts = re.split(
-                    r'(!\[.*?\]\(images/[^\)]+\)|<img\s+src="images/[^"]+"[^>]*>)',
-                    final_md
-                )
-
                 for part in parts:
-                    if part.startswith('!['):
-                        alt_match = re.search(r'!\[([^\]]*)\]', part)
-                        path_match = re.search(r'\((images/[^\)]+)\)', part)
-                        alt_text = alt_match.group(1) if alt_match else ""
-                        if path_match:
-                            img_path = path_match.group(1)
-                            if Path(img_path).exists():
-                                st.image(img_path, caption=alt_text or None, use_container_width=True)
-                            else:
-                                st.markdown(
-                                    f'<p style="font-size:0.8rem;color:#4a4f5e;font-style:italic;">Image not found: {img_path}</p>',
-                                    unsafe_allow_html=True
-                                )
-                    elif part.startswith('<img '):
-                        src_match = re.search(r'src="(images/[^"]+)"', part)
-                        alt_match = re.search(r'alt="([^"]*)"', part)
-                        if src_match:
-                            img_path = src_match.group(1)
-                            alt_text = alt_match.group(1) if alt_match else ""
-                            if Path(img_path).exists():
-                                st.image(img_path, caption=alt_text or None, use_container_width=True)
-                            else:
-                                st.markdown(
-                                    f'<p style="font-size:0.8rem;color:#4a4f5e;font-style:italic;">Image not found: {img_path}</p>',
-                                    unsafe_allow_html=True
-                                )
+                    if part[0] == "image":
+                        img_path = part[1]
+                        caption = part[2]
+                        if Path(img_path).exists():
+                            col1, col2, col3 = st.columns([1, 6, 1])
+                            with col2:
+                                st.image(img_path, caption=caption or None, use_container_width=True)
+                        else:
+                            st.markdown(
+                                f'<p style="font-size:0.8rem;color:#4a4f5e;font-style:italic;text-align:center;">⚠ Image not found: {img_path}</p>',
+                                unsafe_allow_html=True
+                            )
                     else:
-                        if part.strip():
-                            st.markdown(part, unsafe_allow_html=True)
+                        text = part[1]
+                        # Strip any leftover <p align="center"><em>caption</em></p> lines
+                        # that were adjacent to image blocks (already extracted above)
+                        text = re.sub(r'<p[^>]*>\s*<em>[^<]*</em>\s*</p>', '', text, flags=re.DOTALL)
+                        if text.strip():
+                            st.markdown(text, unsafe_allow_html=True)
 
             title = "blog"
             if out.get("plan"):
