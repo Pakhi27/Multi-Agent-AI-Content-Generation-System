@@ -597,10 +597,13 @@ if run_btn:
         unsafe_allow_html=True
     )
 
+    spinner_placeholder = st.empty()
     try:
-        with st.spinner("Generating your blog — this takes 1–2 minutes…"):
-            out = app.invoke(inputs)
+        with spinner_placeholder:
+            with st.spinner("Generating your blog — this takes 1–2 minutes…"):
+                out = app.invoke(inputs)
 
+        spinner_placeholder.empty()
         st.session_state["last_out"] = out
         progress.progress(1.0)
         status.markdown(
@@ -609,6 +612,7 @@ if run_btn:
         )
 
     except Exception as e:
+        spinner_placeholder.empty()
         progress.empty()
         status.markdown(
             f'<p style="font-size:0.875rem;color:#e87a7a;">✕ Error: {e}</p>',
