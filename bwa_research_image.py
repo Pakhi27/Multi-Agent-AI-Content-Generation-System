@@ -265,38 +265,117 @@ def research_node(state: State) -> dict:
 # -----------------------------
 # 5) Orchestrator
 # -----------------------------
-ORCH_SYSTEM = """You are a technical blog planner. Produce a concise outline.
 
-Rules:
-- Create EXACTLY 4–6 sections (no more than 6).
-- Each section: goal (1 sentence), 3–4 bullets, target_words 150–350.
-- Include at least 1 section with requires_code=True.
+ORCH_SYSTEM = """You are a technical blog planner.
+
+YOU MUST return a single JSON object that EXACTLY matches this structure (no extra keys, no renaming):
+
+{
+  "blog_title": "<string>",
+  "audience": "<string>",
+  "tone": "<string>",
+  "blog_kind": "explainer",
+  "constraints": [],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "<section title>",
+      "goal": "<one sentence>",
+      "bullets": ["<point>", "<point>", "<point>"],
+      "target_words": 200,
+      "tags": [],
+      "requires_research": false,
+      "requires_citations": false,
+      "requires_code": false
+    }
+  ]
+}
+
+RULES:
+- tasks array must have EXACTLY 4-6 items.
+- id must be sequential integers starting at 1.
+- Each task must have 3-4 bullets (plain strings).
+- target_words must be between 150 and 350.
+- At least 1 task must have requires_code=true.
+- NEVER use keys like "section1", "section2". Use the exact schema above.
 - closed_book: evergreen content only.
-- hybrid: use evidence for examples; set requires_citations=True on those sections.
-- open_book: blog_kind="news_roundup", summarize events with evidence URLs.
-
-Output must strictly match the Plan schema. Respond in JSON format.
+- hybrid: use evidence for examples; requires_citations=true on those tasks.
+- open_book: blog_kind="news_roundup".
+- Respond ONLY with the raw JSON object. No markdown fences, no preamble.
 """
 
 
+def _repair_plan_json(raw: dict, topic: str) -> dict:
+    """Convert section1/section2/... LLM output into valid Plan schema."""
+    if "tasks" in raw and "blog_title" in raw:
+        return raw  # Already correct
+
+    tasks = []
+    for i, (key, val) in enumerate(raw.items(), start=1):
+        if not isinstance(val, dict):
+            continue
+        bullets = val.get("bullets", [])
+        if bullets and isinstance(bullets[0], dict):
+            bullets = [b.get("text", str(b)) for b in bullets]
+        tasks.append({
+            "id": i,
+            "title": val.get("title", key.replace("section", "Section ")),
+            "goal": val.get("goal", ""),
+            "bullets": (bullets[:4] if bullets else ["Point 1", "Point 2", "Point 3"]),
+            "target_words": val.get("target_words", 200),
+            "tags": val.get("tags", []),
+            "requires_research": val.get("requires_research", False),
+            "requires_citations": val.get("requires_citations", False),
+            "requires_code": val.get("requires_code", False),
+        })
+
+    tasks = tasks[:6]
+    if tasks and not any(t["requires_code"] for t in tasks):
+        tasks[-1]["requires_code"] = True
+
+    return {
+        "blog_title": raw.get("blog_title", topic),
+        "audience": raw.get("audience", "software engineers"),
+        "tone": raw.get("tone", "technical and clear"),
+        "blog_kind": raw.get("blog_kind", "explainer"),
+        "constraints": raw.get("constraints", []),
+        "tasks": tasks,
+    }
+
+
 def orchestrator_node(state: State) -> dict:
-    planner = llm_strong.with_structured_output(Plan, method="json_mode")
+    import json as _json
+
     evidence = state.get("evidence") or []
     mode = state.get("mode") or "closed_book"
+    topic = state["topic"]
 
-    plan = planner.invoke(
-        [
-            SystemMessage(content=ORCH_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Topic: {state['topic']}\n"
-                    f"Mode: {mode}\n\n"
-                    f"Evidence (ONLY use for fresh claims; may be empty):\n"
-                    f"{[e.model_dump() for e in evidence][:16]}"
-                )
-            ),
-        ]
-    )
+    raw_response = llm_strong.invoke([
+        SystemMessage(content=ORCH_SYSTEM),
+        HumanMessage(
+            content=(
+                f"Topic: {topic}\n"
+                f"Mode: {mode}\n\n"
+                f"Evidence (ONLY use for fresh claims; may be empty):\n"
+                f"{[e.model_dump() for e in evidence][:16]}"
+            )
+        ),
+    ])
+
+    raw_text = raw_response.content.strip()
+
+    # Strip markdown code fences if present
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r"^```[a-z]*\n?", "", raw_text)
+        raw_text = re.sub(r"\n?```$", "", raw_text.strip())
+
+    try:
+        raw_dict = _json.loads(raw_text)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"Orchestrator returned invalid JSON: {e}\n\nRaw:\n{raw_text[:500]}")
+
+    repaired = _repair_plan_json(raw_dict, topic)
+    plan = Plan(**repaired)
     return {"plan": plan}
 
 
@@ -459,24 +538,15 @@ def merge_content(state: State) -> dict:
 # 2. Decide Images (LIMITED TO 2)
 # -------------------------------
 
-DECIDE_IMAGES_SYSTEM = """You are an expert technical art director for a high-end developer blog.
+DECIDE_IMAGES_SYSTEM = """You are an expert technical editor and art director.
 
-Your job: plan exactly 2 striking hero images for the blog post.
+Rules for Images:
+- Max 2 images only.
+- DO NOT request diagrams with text, arrows, or flowcharts (AI image models fail at generating legible text/diagrams).
+- Instead, request high-quality, abstract, minimalist vector art or conceptual isometric illustrations that visually represent the technical concepts.
+- The prompt MUST be highly descriptive and specify styles like "minimalist, sleek, modern tech, isometric, vector art, vibrant colors".
 
-STRICT RULES:
-- Exactly 2 images. No more, no less.
-- NO text, NO labels, NO arrows, NO diagrams, NO flowcharts in the image — AI image models cannot render readable text.
-- Each image prompt must be 40-80 words, highly descriptive, specifying:
-    * The core visual metaphor (e.g. "interconnected glowing neural nodes floating in dark space")
-    * Art style: "photorealistic 3D render" OR "cinematic isometric illustration" OR "abstract neon concept art"
-    * Color palette: e.g. "deep navy and electric blue with gold highlights"
-    * Mood/lighting: e.g. "dramatic rim lighting, volumetric fog"
-    * Quality boosters: "ultra-detailed, 8k resolution, professional studio quality"
-- The `target_heading` must exactly match one of the ## section headings in the blog (copy it verbatim).
-- First image: hero banner concept representing the overall topic.
-- Second image: a mid-article visual representing a specific technical sub-concept.
-
-Return strictly GlobalImagePlan JSON.
+Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
@@ -516,38 +586,16 @@ import textwrap
 
 
 def generate_flux_image(prompt: str):
-    """
-    Generate a high-quality image via Pollinations.ai using the flux-pro model.
-    Falls back to flux if flux-pro fails.
-    """
-    # Enrich prompt for technical blog quality
-    enriched_prompt = (
-        f"{prompt}, "
-        "ultra-detailed, professional technical illustration, "
-        "dark background, vibrant accent colors, minimalist modern design, "
-        "8k, sharp focus, no text, no watermark"
-    )
-    encoded_prompt = urllib.parse.quote(enriched_prompt)
+    encoded_prompt = urllib.parse.quote(prompt)
 
-    models_to_try = ["flux-pro", "flux"]
-    last_exc = None
-
-    for model in models_to_try:
-        try:
-            url = (
-                f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-                f"?width=1280&height=720&model={model}&enhance=true&nologo=true&seed={hash(prompt) % 99999}"
-            )
-            response = requests.get(url, timeout=90)
-            response.raise_for_status()
-            img = Image.open(BytesIO(response.content)).convert("RGBA")
-            print(f"Image generated with model: {model}")
-            return img
-        except Exception as e:
-            last_exc = e
-            print(f"Model {model} failed: {e}, trying next…")
-
-    raise RuntimeError(f"All image models failed. Last error: {last_exc}")
+    # 🔥 Best free model available right now
+    # Changed to 1280x720 to fix the "image coming very large" issue and provide a better blog banner ratio
+    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1280&height=720&model=flux&enhance=true&nologo=true"
+    
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    
+    return Image.open(BytesIO(response.content)).convert("RGBA")
 
 
 def add_text_overlay(image: Image.Image, title: str, subtitle: str = ""):
