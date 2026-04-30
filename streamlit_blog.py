@@ -589,35 +589,37 @@ if run_btn:
         "final": "",
     }
 
-    progress = st.progress(0)
-    status = st.empty()
+    gen_container = st.empty()
 
-    status.markdown(
-        '<p style="font-size:0.85rem;color:#7a7f8e;">⚙️ Initialising pipeline…</p>',
-        unsafe_allow_html=True
-    )
+    with gen_container.container():
+        progress = st.progress(0)
+        status = st.empty()
+        status.markdown(
+            '<p style="font-size:0.85rem;color:#7a7f8e;">⚙️ Initialising pipeline…</p>',
+            unsafe_allow_html=True
+        )
 
-    spinner_placeholder = st.empty()
     try:
-        with spinner_placeholder:
+        with gen_container.container():
             with st.spinner("Generating your blog — this takes 1–2 minutes…"):
                 out = app.invoke(inputs)
 
-        spinner_placeholder.empty()
+        # Clear everything — no ghost box left behind
+        gen_container.empty()
         st.session_state["last_out"] = out
-        progress.progress(1.0)
-        status.markdown(
-            '<p style="font-size:0.875rem;color:#5cb88a;font-weight:600;">✓ Blog generated successfully</p>',
-            unsafe_allow_html=True
-        )
+        st.session_state["gen_success"] = True
 
     except Exception as e:
-        spinner_placeholder.empty()
-        progress.empty()
-        status.markdown(
-            f'<p style="font-size:0.875rem;color:#e87a7a;">✕ Error: {e}</p>',
-            unsafe_allow_html=True
-        )
+        gen_container.empty()
+        st.session_state["gen_error"] = str(e)
+
+# Show success / error banners (survive the rerun, but outside any container)
+if st.session_state.pop("gen_success", False):
+    st.toast("✓ Blog generated successfully!", icon="✅")
+
+if "gen_error" in st.session_state:
+    err = st.session_state.pop("gen_error")
+    st.error(f"✕ Error: {err}")
 
 # -----------------------------
 # Render Output
@@ -630,41 +632,57 @@ if out:
     # ── Blog Preview ──
     with tab_preview:
         if final_md:
-            st.markdown('<div class="blog-wrap">', unsafe_allow_html=True)
+            # Use st.container so st.image() renders correctly alongside markdown.
+            # Apply blog-wrap styling via CSS targeting the container's inner div.
+            st.markdown("""
+            <style>
+            [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"] > div:first-child {
+                background: var(--bg-card) !important;
+                border-radius: var(--radius-lg) !important;
+                padding: 3rem 3.5rem !important;
+                line-height: 1.85 !important;
+                max-width: 780px !important;
+                margin: 0 auto 2rem !important;
+            }
+            </style>
+            """, unsafe_allow_html=True)
 
-            parts = re.split(
-                r'(!\[.*?\]\(images/[^\)]+\)|<img\s+src="images/[^"]+"[^>]*>)',
-                final_md
-            )
+            with st.container(border=True):
+                parts = re.split(
+                    r'(!\[.*?\]\(images/[^\)]+\)|<img\s+src="images/[^"]+"[^>]*>)',
+                    final_md
+                )
 
-            for part in parts:
-                if part.startswith('!['):
-                    match = re.search(r'\((images/[^\)]+)\)', part)
-                    if match:
-                        img_path = match.group(1)
-                        if Path(img_path).exists():
-                            st.image(img_path, use_container_width=True)
-                        else:
-                            st.markdown(
-                                f'<p style="font-size:0.8rem;color:#4a4f5e;font-style:italic;">Image not found: {img_path}</p>',
-                                unsafe_allow_html=True
-                            )
-                elif part.startswith('<img '):
-                    match = re.search(r'src="(images/[^"]+)"', part)
-                    if match:
-                        img_path = match.group(1)
-                        if Path(img_path).exists():
-                            st.image(img_path, use_container_width=True)
-                        else:
-                            st.markdown(
-                                f'<p style="font-size:0.8rem;color:#4a4f5e;font-style:italic;">Image not found: {img_path}</p>',
-                                unsafe_allow_html=True
-                            )
-                else:
-                    if part.strip():
-                        st.markdown(part, unsafe_allow_html=True)
-
-            st.markdown('</div>', unsafe_allow_html=True)
+                for part in parts:
+                    if part.startswith('!['):
+                        alt_match = re.search(r'!\[([^\]]*)\]', part)
+                        path_match = re.search(r'\((images/[^\)]+)\)', part)
+                        alt_text = alt_match.group(1) if alt_match else ""
+                        if path_match:
+                            img_path = path_match.group(1)
+                            if Path(img_path).exists():
+                                st.image(img_path, caption=alt_text or None, use_container_width=True)
+                            else:
+                                st.markdown(
+                                    f'<p style="font-size:0.8rem;color:#4a4f5e;font-style:italic;">Image not found: {img_path}</p>',
+                                    unsafe_allow_html=True
+                                )
+                    elif part.startswith('<img '):
+                        src_match = re.search(r'src="(images/[^"]+)"', part)
+                        alt_match = re.search(r'alt="([^"]*)"', part)
+                        if src_match:
+                            img_path = src_match.group(1)
+                            alt_text = alt_match.group(1) if alt_match else ""
+                            if Path(img_path).exists():
+                                st.image(img_path, caption=alt_text or None, use_container_width=True)
+                            else:
+                                st.markdown(
+                                    f'<p style="font-size:0.8rem;color:#4a4f5e;font-style:italic;">Image not found: {img_path}</p>',
+                                    unsafe_allow_html=True
+                                )
+                    else:
+                        if part.strip():
+                            st.markdown(part, unsafe_allow_html=True)
 
             title = "blog"
             if out.get("plan"):
