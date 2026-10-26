@@ -1,6 +1,6 @@
 # ✦ BlogForge AI — Multi-Agent Content Generation System
 
-> An end-to-end AI pipeline that researches, plans, writes, and illustrates technical blog posts — fully automated using LangGraph, Groq (LLaMA 3.3), Tavily, and a Streamlit UI.
+> An end-to-end AI pipeline that researches, plans, writes, and illustrates technical blog posts — fully automated using LangGraph, Groq, web search (Tavily or DuckDuckGo), and a Streamlit UI.
 
 ---
 
@@ -74,7 +74,7 @@ flowchart TD
 | Agent | Responsibility |
 |---|---|
 | **Router** | Decides whether web research is needed (`closed_book` / `hybrid` / `open_book`) and generates search queries |
-| **Research** | Runs Tavily web searches, deduplicates and validates evidence items |
+| **Research** | Runs Tavily or DuckDuckGo web searches, deduplicates and validates evidence items |
 | **Orchestrator** | Produces a structured `Plan` (4–6 sections) with goals, bullets, word targets, and flags |
 | **Worker (×N)** | Writes one section each in parallel, grounded by evidence and plan constraints |
 | **Critic** | Scores each section's groundedness against Evidence, flags unsupported claims, and triggers one bounded self-correction rewrite |
@@ -85,12 +85,13 @@ flowchart TD
 ##  Features
 
 - **Intelligent routing** — automatically selects `closed_book`, `hybrid`, or `open_book` mode based on topic volatility
-- **Web research** — Tavily-powered search with LLM-driven deduplication and source quality filtering
+- **Web research** — Tavily when configured; otherwise free **DuckDuckGo** fallback — with LLM-driven deduplication and source quality filtering
 - **Long-term memory** — every generated blog (topic, tone, quality score) is persisted to `memory_store.json`; the Orchestrator recalls topically-related past runs so it avoids repeating titles/structure and stays tone-consistent across sessions
 - **Human-in-the-loop approval gate** — the pipeline can pause after planning so a human reviews/edits section titles, bullets, word targets, and citation/code flags (via an editable table in the Streamlit UI) before any writer agent runs; an "auto mode" toggle skips the pause for single-click generation
 - **Reflection / self-critique loop** — a Critic agent scores each citation-requiring or `open_book` section for groundedness (0–100) against the Evidence pool and triggers one bounded rewrite pass for any section that scores below 70, flagging unsupported claims
 - **Parallel writing** — LangGraph `Send()` fans out section tasks to worker agents concurrently
-- **AI image generation** — Free Flux model via Pollinations API; images get professional text overlays with title/subtitle
+- **AI image generation** — Flux via Pollinations with editorial-style prompts; hero image gets a soft magazine cover overlay (title wrapping). Failed image API calls do **not** leave dead `<img>` links in the Markdown
+- **Required conclusion section** — every plan ends with a takeaways / conclusion section so posts don’t end abruptly
 - **Structured outputs** — All agents use Pydantic schemas (`Plan`, `Task`, `EvidencePack`, `ImageSpec`, `ClaimCheck`) for reliable, validated responses
 - **Graceful degradation** — Image, research, and critic-judge failures are caught and logged without blocking the pipeline
 - **Streamlit UI** — Dark editorial interface with live preview, plan editor, evidence viewer, evaluation scores, memory log, image gallery, and debug logs
@@ -117,11 +118,12 @@ flowchart TD
 
 | Layer | Technology |
 |---|---|
-| Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) (StateGraph + subgraph) |
-| LLM | [Groq](https://groq.com/) — `llama-3.3-70b-versatile` |
-| Web Search | [Tavily](https://tavily.com/) |
-| Image Generation | [Pollinations.ai](https://pollinations.ai/) (Flux model, free) |
-| Image Processing | Pillow (text overlay rendering) |
+| Orchestration | [LangGraph](https://github.com/langchain-ai/langgraph) (StateGraph + subgraph + `Send()` fan-out) |
+| LLM | [Groq](https://groq.com/) — default `openai/gpt-oss-120b` / `openai/gpt-oss-20b` (override via `GROQ_STRONG_MODEL` / `GROQ_FAST_MODEL`) |
+| Web Search | [Tavily](https://tavily.com/) **or** DuckDuckGo (`ddgs`) free fallback |
+| Image Generation | [Pollinations.ai](https://pollinations.ai/) (Flux, free tier) |
+| Image Processing | Pillow (editorial cover overlay) |
+| Memory | Local JSON long-term store (`memory_store.py`) |
 | Data Validation | Pydantic v2 |
 | UI | Streamlit |
 | Environment | python-dotenv |
@@ -131,14 +133,14 @@ flowchart TD
 ## 📁 Project Structure
 
 ```
-blogforge-ai/
+Multi-Agent-AI-Content-Generation-System/
 ├── bwa_research_image.py      # Core multi-agent pipeline (LangGraph)
-├── streamlit_blog.py          # Streamlit frontend UI
+├── streamlit_blog.py          # Streamlit frontend UI (+ HITL plan approval)
 ├── memory_store.py            # Lightweight long-term memory (JSON-based recall)
 ├── test_pipeline_offline.py   # Offline end-to-end test (all external calls mocked)
-├── memory_store.json          # Generated at runtime — long-term memory (not committed)
-├── images/                    # Generated images (auto-created at runtime)
-├── .env                       # API keys (not committed)
+├── memory_store.json          # Generated at runtime — not committed
+├── images/                    # Generated images — not committed
+├── .env                       # API keys — not committed
 ├── requirements.txt
 └── README.md
 ```
@@ -166,13 +168,16 @@ Create a `.env` file in the project root:
 
 ```env
 GROQ_API_KEY=your_groq_api_key
-TAVILY_API_KEY=your_tavily_api_key
+TAVILY_API_KEY=          # optional — if empty, DuckDuckGo is used automatically
+# Optional model overrides:
+# GROQ_STRONG_MODEL=openai/gpt-oss-120b
+# GROQ_FAST_MODEL=openai/gpt-oss-20b
 ```
 
-| Variable | Where to get it |
-|---|---|
-| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) |
-| `TAVILY_API_KEY` | [app.tavily.com](https://app.tavily.com) |
+| Variable | Required? | Where to get it |
+|---|---|---|
+| `GROQ_API_KEY` | **Yes** | [console.groq.com](https://console.groq.com) |
+| `TAVILY_API_KEY` | No | [app.tavily.com](https://app.tavily.com) — leave empty to use free DuckDuckGo |
 
 ### 4. Run the Streamlit app
 
@@ -193,9 +198,9 @@ This will generate a blog on `"Self Attention in Transformer Architecture"` by d
 ##  How It Works — Step by Step
 
 1. **Router** receives the topic and determines research mode + generates search queries if needed.
-2. **Research Agent** (optional) queries Tavily, cleans results, and builds a deduplicated `EvidencePack`.
+2. **Research Agent** (optional) queries Tavily or DuckDuckGo, cleans results, and builds a deduplicated `EvidencePack`.
 3. **Memory recall** — the Orchestrator looks up topically-related past blogs from long-term memory before planning.
-4. **Orchestrator** creates a structured `Plan` — 4 to 6 sections with goals, bullets, word targets, and flags like `requires_code` or `requires_citations`.
+4. **Orchestrator** creates a structured `Plan` — 4 to 6 sections with goals, bullets, word targets, flags like `requires_code` / `requires_citations`, and a required conclusion section.
 5. **Human-in-the-loop checkpoint** *(optional, on by default)* — the pipeline pauses here; you review/edit the plan in the Streamlit UI, then approve it to continue.
 6. **Fan-out** dispatches each section as a parallel `Send()` to individual Worker agents.
 7. **Workers** write their sections in Markdown, grounded by the plan and evidence, respecting citation and code constraints.
@@ -262,9 +267,10 @@ url = f"...?width=1280&height=720&model=flux..."
 
 ##  Known Limitations
 
-- Image generation depends on the free Pollinations API — availability and quality may vary
-- LLaMA 3.3 on Groq has rate limits; large plans with many parallel workers may occasionally hit them (retries are configured)
-- Font rendering for image overlays requires `arial.ttf` to be available on the system; falls back to PIL's default font otherwise
+- Image generation depends on the free Pollinations API — availability, rate limits, and quality may vary (pipeline skips embeds if generation fails)
+- Groq rate limits can affect large parallel worker fan-outs (retries are configured; model IDs are env-overridable as catalogs change)
+- Cover overlay prefers Segoe UI / Calibri / Arial on Windows; falls back to PIL's default font otherwise
+- Long-term memory uses lightweight string similarity (not embeddings) — good for small histories; swap to a vector DB for large-scale recall
 
 ---
 
