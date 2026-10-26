@@ -15,7 +15,14 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from bwa_research_image import app
+from bwa_research_image import (
+    app,
+    plan_app,
+    writing_app,
+    default_initial_state,
+    Plan,
+)
+import memory_store
 
 
 # -----------------------------
@@ -511,8 +518,17 @@ with st.sidebar:
     st.markdown('<div class="sidebar-label">As-of Date</div>', unsafe_allow_html=True)
     as_of = st.date_input("Date", value=date.today(), label_visibility="collapsed")
 
+    st.markdown('<div class="sidebar-label">Human-in-the-loop</div>', unsafe_allow_html=True)
+    require_approval = st.checkbox(
+        "Review & approve plan before writing",
+        value=True,
+        help="When checked, the pipeline stops after planning so you can edit "
+             "sections/bullets/word counts before any writer agent runs.",
+    )
+
     st.markdown("<br>", unsafe_allow_html=True)
-    run_btn = st.button("✦  Generate Blog", use_container_width=True)
+    plan_btn_label = "✦  Generate Plan" if require_approval else "✦  Generate Blog"
+    run_btn = st.button(plan_btn_label, use_container_width=True)
 
     st.markdown('<div class="sidebar-label">Past Blogs</div>', unsafe_allow_html=True)
     # Exclude README.md, CHANGELOG.md and other non-blog files
@@ -540,8 +556,11 @@ with st.sidebar:
     pipeline_steps = [
         ("Router", "routes topic to research mode"),
         ("Research", "fetches web evidence"),
+        ("Memory", "recalls related past blogs"),
         ("Orchestrator", "builds structured plan"),
+        ("Human approval", "you review/edit the plan" if require_approval else "skipped (auto mode)"),
         ("Workers", "writes each section"),
+        ("Critic", "scores groundedness, self-corrects"),
         ("Reducer", "merges + adds images"),
     ]
     pipeline_html = ""
@@ -560,8 +579,9 @@ with st.sidebar:
 # -----------------------------
 # Tabs
 # -----------------------------
-tab_preview, tab_plan, tab_evidence, tab_images, tab_logs = st.tabs(
-    ["  Blog Preview  ", "  Content Plan  ", "  Research  ", "  Images  ", "  Debug  "]
+tab_preview, tab_plan, tab_evidence, tab_eval, tab_memory, tab_images, tab_logs = st.tabs(
+    ["  Blog Preview  ", "  Content Plan  ", "  Research  ", "  Evaluation  ",
+     "  Memory  ", "  Images  ", "  Debug  "]
 )
 
 # -----------------------------
@@ -569,52 +589,173 @@ tab_preview, tab_plan, tab_evidence, tab_images, tab_logs = st.tabs(
 # -----------------------------
 if "last_out" not in st.session_state:
     st.session_state["last_out"] = None
+if "draft_state" not in st.session_state:
+    st.session_state["draft_state"] = None
 
 # -----------------------------
-# Run
+# Run — Phase 1: Plan (always runs router -> research -> orchestrator)
 # -----------------------------
 if run_btn:
     if not topic.strip():
         st.warning("Please enter a topic before generating.")
         st.stop()
 
-    inputs = {
-        "topic": topic,
-        "mode": "",
-        "needs_research": False,
-        "queries": [],
-        "evidence": [],
-        "plan": None,
-        "sections": [],
-        "merged_md": "",
-        "md_with_placeholders": "",
-        "image_specs": [],
-        "final": "",
-    }
+    inputs = default_initial_state(topic)
 
     gen_area = st.empty()
-    with gen_area.container():
-        progress = st.progress(0)
-        status = st.empty()
-        status.markdown(
-            '<p style="font-size:0.85rem;color:#7a7f8e;">⚙️ Initialising pipeline…</p>',
-            unsafe_allow_html=True
-        )
-
     try:
         with gen_area.container():
-            with st.spinner("Generating your blog — this takes 1–2 minutes…"):
-                out = app.invoke(inputs)
-
-        # Wipe the spinner/progress container completely — no ghost box
+            with st.spinner("Routing, researching & planning…"):
+                plan_state = plan_app.invoke(inputs)
         gen_area.empty()
-        st.session_state["last_out"] = out
-        st.toast("✓ Blog generated successfully!", icon="✅")
-        st.rerun()
+
+        if require_approval:
+            # Stop here — human reviews/edits the plan in the Content Plan tab.
+            st.session_state["draft_state"] = plan_state
+            st.session_state["last_out"] = None
+            st.toast("✓ Plan ready — review it in the Content Plan tab", icon="🧩")
+            st.rerun()
+        else:
+            # Auto mode: immediately continue to writing (no approval pause).
+            with gen_area.container():
+                with st.spinner("Writing sections, self-critiquing & adding images — this takes 1–2 minutes…"):
+                    final_state = writing_app.invoke(plan_state)
+            gen_area.empty()
+            st.session_state["draft_state"] = None
+            st.session_state["last_out"] = final_state
+            st.toast("✓ Blog generated successfully!", icon="✅")
+            st.rerun()
 
     except Exception as e:
         gen_area.empty()
         st.error(f"✕ Error: {e}")
+
+# -----------------------------
+# Run — Phase 2: Approve & Write (human-in-the-loop resume point)
+# The editor + "Approve & Write Blog" button live in the Content Plan tab
+# (rendered further below); when clicked, they set `trigger_write` and rerun,
+# and this block does the actual writing-phase invocation on the next run.
+# -----------------------------
+if st.session_state.get("trigger_write"):
+    st.session_state["trigger_write"] = False
+    edited_plan = st.session_state.get("edited_plan_dict")
+    draft_state = dict(st.session_state["draft_state"])
+    if edited_plan is not None:
+        try:
+            draft_state["plan"] = Plan(**edited_plan)
+        except Exception as e:
+            st.error(f"✕ Could not apply your edits (invalid plan): {e}")
+            st.stop()
+
+    gen_area2 = st.empty()
+    try:
+        with gen_area2.container():
+            with st.spinner("Writing sections, self-critiquing & adding images — this takes 1–2 minutes…"):
+                final_state = writing_app.invoke(draft_state)
+        gen_area2.empty()
+        st.session_state["last_out"] = final_state
+        st.session_state["draft_state"] = None
+        st.toast("✓ Blog generated successfully!", icon="✅")
+        st.rerun()
+    except Exception as e:
+        gen_area2.empty()
+        st.error(f"✕ Error: {e}")
+
+# -----------------------------
+# Content Plan tab — human-in-the-loop draft editor
+# Shown only while a plan is awaiting approval (draft_state set, no output yet).
+# -----------------------------
+draft_state = st.session_state.get("draft_state")
+if require_approval and draft_state and not st.session_state.get("last_out"):
+    with tab_plan:
+        plan_obj = draft_state.get("plan")
+        if plan_obj:
+            plan_dict = plan_obj.model_dump() if hasattr(plan_obj, "model_dump") else plan_obj
+
+            st.markdown(f"""
+            <div class="plan-header">
+                <div class="plan-title">{plan_dict.get("blog_title", "Untitled")}</div>
+                <div class="plan-meta">
+                    <div class="plan-meta-item">Audience &nbsp;<span>{plan_dict.get("audience", "—")}</span></div>
+                    <div class="plan-meta-item">Tone &nbsp;<span>{plan_dict.get("tone", "—")}</span></div>
+                    <div class="plan-meta-item">Mode &nbsp;<span>{draft_state.get("mode", "—")}</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.info(
+                "🧑‍⚖️ **Human-in-the-loop checkpoint** — edit titles, bullets, word "
+                "targets, or citation/code flags below, then click **Approve & Write "
+                "Blog** to let the writer agents continue."
+            )
+
+            tasks = plan_dict.get("tasks", [])
+            edit_rows = [{
+                "id": t.get("id"),
+                "title": t.get("title", ""),
+                "goal": t.get("goal", ""),
+                "bullets": " | ".join(t.get("bullets", [])),
+                "target_words": t.get("target_words", 200),
+                "requires_citations": bool(t.get("requires_citations", False)),
+                "requires_code": bool(t.get("requires_code", False)),
+            } for t in tasks]
+
+            edited_df = st.data_editor(
+                pd.DataFrame(edit_rows),
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "bullets": st.column_config.TextColumn("Bullets (separate with |)", width="large"),
+                    "id": st.column_config.NumberColumn("ID", disabled=True),
+                },
+                key="plan_editor",
+            )
+
+            # Rebuild a valid Plan dict from the edited rows for the Approve step.
+            originals_by_id = {t.get("id"): t for t in tasks}
+            edited_tasks = []
+            for _, row in edited_df.iterrows():
+                tid = int(row["id"])
+                original = originals_by_id.get(tid, {})
+                bullets = [b.strip() for b in str(row["bullets"]).split("|") if b.strip()]
+                while len(bullets) < 3:
+                    bullets.append("(edit this bullet)")
+                edited_tasks.append({
+                    "id": tid,
+                    "title": row["title"],
+                    "goal": row["goal"],
+                    "bullets": bullets[:4],
+                    "target_words": int(row["target_words"]),
+                    "tags": original.get("tags", []),
+                    "requires_research": original.get("requires_research", False),
+                    "requires_citations": bool(row["requires_citations"]),
+                    "requires_code": bool(row["requires_code"]),
+                })
+
+            st.session_state["edited_plan_dict"] = {
+                "blog_title": plan_dict.get("blog_title"),
+                "audience": plan_dict.get("audience"),
+                "tone": plan_dict.get("tone"),
+                "blog_kind": plan_dict.get("blog_kind"),
+                "constraints": plan_dict.get("constraints", []),
+                "tasks": edited_tasks,
+            }
+
+            if draft_state.get("memory_context"):
+                with st.expander(f"🧠 Related past blogs recalled from memory ({len(draft_state['memory_context'])})"):
+                    for m in draft_state["memory_context"]:
+                        st.markdown(
+                            f"- **{m.get('blog_title')}** — tone: {m.get('tone')}, "
+                            f"kind: {m.get('blog_kind')}, quality: {m.get('quality_score')}"
+                        )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("✅  Approve & Write Blog", type="primary"):
+                st.session_state["trigger_write"] = True
+                st.rerun()
+        else:
+            st.warning("Plan generation did not return a plan. Please try again.")
 
 # -----------------------------
 # Render Output
@@ -771,6 +912,46 @@ if out:
             </div>
             """, unsafe_allow_html=True)
 
+    # ── Evaluation (reflection / self-critique) ──
+    with tab_eval:
+        critic_report = out.get("critic_report", [])
+        quality_score = out.get("quality_score")
+
+        if critic_report:
+            if quality_score is not None:
+                score_color = "#5cb88a" if quality_score >= 85 else ("#e8c97a" if quality_score >= 70 else "#e87a7a")
+                st.markdown(f"""
+                <div class="stat-card">
+                    <div class="stat-label">Overall Groundedness / Quality Score</div>
+                    <div class="stat-value" style="font-size:1.8rem;color:{score_color};">{quality_score} / 100</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            rows = []
+            for c in critic_report:
+                rows.append({
+                    "Section": c.get("title", c.get("section_id")),
+                    "Groundedness": c.get("groundedness_score"),
+                    "Self-corrected?": "✓ rewritten" if c.get("revised") else "—",
+                    "Flagged claims": ", ".join(c.get("unsupported_claims", [])) or "—",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.markdown(
+                '<p style="font-size:0.8rem;color:#4a4f5e;margin-top:0.6rem;">'
+                'The Critic agent scores each citation-requiring / open_book section for '
+                'groundedness against the Evidence pool, then triggers one bounded rewrite '
+                'pass for any section scoring below 70.</p>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown("""
+            <div class="empty-state">
+                <div class="icon">🪞</div>
+                <h3>No evaluation data</h3>
+                <p>Self-critique / groundedness scores will appear here after generation.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
     # ── Images ──
     with tab_images:
         images_dir = Path("images")
@@ -827,5 +1008,41 @@ else:
             <div class="icon">✦</div>
             <h3>Ready to generate</h3>
             <p>Enter your topic in the sidebar and click <strong style="color:#e8c97a;">Generate Blog</strong> to get started.</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+# -----------------------------
+# Memory tab — long-term memory store (always visible, independent of `out`)
+# -----------------------------
+with tab_memory:
+    memories = memory_store.all_memories()
+    st.markdown(f"""
+    <div class="stat-card">
+        <div class="stat-label">Long-Term Memory</div>
+        <div class="stat-value">{len(memories)} blog(s) remembered across sessions</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    this_run_memory = (out or {}).get("memory_context") or (st.session_state.get("draft_state") or {}).get("memory_context")
+    if this_run_memory:
+        st.markdown("**Recalled for the current topic:**")
+        for m in this_run_memory:
+            st.markdown(
+                f"- **{m.get('blog_title')}** — tone: {m.get('tone')}, "
+                f"kind: {m.get('blog_kind')}, quality: {m.get('quality_score')}"
+            )
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    if memories:
+        st.markdown("**Full memory log** (most recent last):")
+        df_mem = pd.DataFrame(memories)
+        st.dataframe(df_mem, use_container_width=True, hide_index=True)
+    else:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="icon">🧠</div>
+            <h3>No memories yet</h3>
+            <p>Every blog you generate is remembered here (topic, tone, quality
+            score) so future runs on related topics can recall it automatically.</p>
         </div>
         """, unsafe_allow_html=True)

@@ -77,7 +77,8 @@ flowchart TD
 | **Research** | Runs Tavily web searches, deduplicates and validates evidence items |
 | **Orchestrator** | Produces a structured `Plan` (4–6 sections) with goals, bullets, word targets, and flags |
 | **Worker (×N)** | Writes one section each in parallel, grounded by evidence and plan constraints |
-| **Reducer** | Merges sections → decides images → generates images via Flux → embeds into final Markdown |
+| **Critic** | Scores each section's groundedness against Evidence, flags unsupported claims, and triggers one bounded self-correction rewrite |
+| **Reducer** | Merges sections → runs the Critic → decides images → generates images via Flux → embeds into final Markdown |
 
 ---
 
@@ -85,12 +86,16 @@ flowchart TD
 
 - **Intelligent routing** — automatically selects `closed_book`, `hybrid`, or `open_book` mode based on topic volatility
 - **Web research** — Tavily-powered search with LLM-driven deduplication and source quality filtering
+- **Long-term memory** — every generated blog (topic, tone, quality score) is persisted to `memory_store.json`; the Orchestrator recalls topically-related past runs so it avoids repeating titles/structure and stays tone-consistent across sessions
+- **Human-in-the-loop approval gate** — the pipeline can pause after planning so a human reviews/edits section titles, bullets, word targets, and citation/code flags (via an editable table in the Streamlit UI) before any writer agent runs; an "auto mode" toggle skips the pause for single-click generation
+- **Reflection / self-critique loop** — a Critic agent scores each citation-requiring or `open_book` section for groundedness (0–100) against the Evidence pool and triggers one bounded rewrite pass for any section that scores below 70, flagging unsupported claims
 - **Parallel writing** — LangGraph `Send()` fans out section tasks to worker agents concurrently
 - **AI image generation** — Free Flux model via Pollinations API; images get professional text overlays with title/subtitle
-- **Structured outputs** — All agents use Pydantic schemas (`Plan`, `Task`, `EvidencePack`, `ImageSpec`) for reliable, validated responses
-- **Graceful degradation** — Image and research failures are caught and logged without blocking the pipeline
-- **Streamlit UI** — Dark editorial interface with live preview, plan inspector, evidence viewer, image gallery, and debug logs
+- **Structured outputs** — All agents use Pydantic schemas (`Plan`, `Task`, `EvidencePack`, `ImageSpec`, `ClaimCheck`) for reliable, validated responses
+- **Graceful degradation** — Image, research, and critic-judge failures are caught and logged without blocking the pipeline
+- **Streamlit UI** — Dark editorial interface with live preview, plan editor, evidence viewer, evaluation scores, memory log, image gallery, and debug logs
 - **Download options** — Export as `.md` or a bundled `.zip` (Markdown + images folder)
+- **Offline test suite** — `test_pipeline_offline.py` exercises the full graph (routing, memory recall, planning, human-edit simulation, parallel fanout, self-correction, image placement, memory persistence) with every external LLM/search/image call mocked, so the pipeline logic can be verified with zero API cost or network access
 
 ---
 
@@ -99,10 +104,12 @@ flowchart TD
 | Tab | Contents |
 |---|---|
 | **Preview** | Rendered blog with inline images and download buttons |
-| **Plan** | Structured content plan table (sections, goals, word targets, flags) |
+| **Content Plan** | Editable content plan table (sections, goals, word targets, citation/code flags) — doubles as the human-in-the-loop approval screen |
 | **Research** | Evidence sources table (title, source domain, URL) |
+| **Evaluation** | Per-section groundedness scores from the Critic agent, overall quality score, and flagged unsupported claims |
+| **Memory** | Long-term memory log of every blog generated across sessions, plus which past blogs were recalled for the current topic |
 | **Images** | Gallery of AI-generated images |
-| **Logs** | Full JSON debug dump of pipeline state |
+| **Debug** | Full JSON debug dump of pipeline state |
 
 ---
 
@@ -125,10 +132,13 @@ flowchart TD
 
 ```
 blogforge-ai/
-├── bwa_research_image.py   # Core multi-agent pipeline (LangGraph)
-├── streamlit_blog.py       # Streamlit frontend UI
-├── images/                 # Generated images (auto-created at runtime)
-├── .env                    # API keys (not committed)
+├── bwa_research_image.py      # Core multi-agent pipeline (LangGraph)
+├── streamlit_blog.py          # Streamlit frontend UI
+├── memory_store.py            # Lightweight long-term memory (JSON-based recall)
+├── test_pipeline_offline.py   # Offline end-to-end test (all external calls mocked)
+├── memory_store.json          # Generated at runtime — long-term memory (not committed)
+├── images/                    # Generated images (auto-created at runtime)
+├── .env                       # API keys (not committed)
 ├── requirements.txt
 └── README.md
 ```
@@ -140,8 +150,8 @@ blogforge-ai/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/blogforge-ai.git
-cd blogforge-ai
+git clone https://github.com/Pakhi27/Multi-Agent-AI-Content-Generation-System.git
+cd Multi-Agent-AI-Content-Generation-System
 ```
 
 ### 2. Install dependencies
@@ -184,11 +194,24 @@ This will generate a blog on `"Self Attention in Transformer Architecture"` by d
 
 1. **Router** receives the topic and determines research mode + generates search queries if needed.
 2. **Research Agent** (optional) queries Tavily, cleans results, and builds a deduplicated `EvidencePack`.
-3. **Orchestrator** creates a structured `Plan` — 4 to 6 sections with goals, bullets, word targets, and flags like `requires_code` or `requires_citations`.
-4. **Fan-out** dispatches each section as a parallel `Send()` to individual Worker agents.
-5. **Workers** write their sections in Markdown, grounded by the plan and evidence, respecting citation and code constraints.
-6. **Reducer subgraph** merges all sections in order, decides on up to 2 image placements, generates images via Flux, adds text overlays, and embeds them into the final Markdown document.
-7. The final `.md` file is saved to disk and rendered in the Streamlit UI.
+3. **Memory recall** — the Orchestrator looks up topically-related past blogs from long-term memory before planning.
+4. **Orchestrator** creates a structured `Plan` — 4 to 6 sections with goals, bullets, word targets, and flags like `requires_code` or `requires_citations`.
+5. **Human-in-the-loop checkpoint** *(optional, on by default)* — the pipeline pauses here; you review/edit the plan in the Streamlit UI, then approve it to continue.
+6. **Fan-out** dispatches each section as a parallel `Send()` to individual Worker agents.
+7. **Workers** write their sections in Markdown, grounded by the plan and evidence, respecting citation and code constraints.
+8. **Critic (self-correction loop)** grades each citation-requiring/`open_book` section's groundedness against the evidence and rewrites any section scoring below 70, once.
+9. **Reducer subgraph** merges all sections in order, decides on up to 2 image placements, generates images via Flux, adds text overlays, and embeds them into the final Markdown document.
+10. The final `.md` file is saved to disk, the run is written to long-term memory, and everything is rendered in the Streamlit UI.
+
+---
+
+##  Testing
+
+Run the offline end-to-end test suite — it mocks every Groq/Tavily/image-API call so the full graph (routing, memory recall, planning, human-edit simulation, parallel fan-out, self-correction, image placement, memory persistence) can be verified with zero API cost and no network access:
+
+```bash
+python test_pipeline_offline.py
+```
 
 ---
 
@@ -241,7 +264,6 @@ url = f"...?width=1280&height=720&model=flux..."
 
 - Image generation depends on the free Pollinations API — availability and quality may vary
 - LLaMA 3.3 on Groq has rate limits; large plans with many parallel workers may occasionally hit them (retries are configured)
-- The `re` module is used in `research_node` but its import is missing from the top of `bwa_research_image.py` — add `import re` if you encounter a `NameError`
 - Font rendering for image overlays requires `arial.ttf` to be available on the system; falls back to PIL's default font otherwise
 
 ---
